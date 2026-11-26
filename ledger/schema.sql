@@ -16,6 +16,8 @@
 --   3. entries and transactions are append-only; mistakes are fixed by reversal
 --   4. an entry's currency must match both its account and its transaction
 --   5. an external reference (UTR) is posted at most once, unless reversed
+--   6. money on hold cannot be spent, a hold resolves exactly once, and a
+--      capture moves exactly what it says to the hold's payee
 
 CREATE TABLE IF NOT EXISTS accounts (
     id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -23,10 +25,23 @@ CREATE TABLE IF NOT EXISTS accounts (
     currency       char(3)     NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
     allow_negative boolean     NOT NULL DEFAULT false,
     balance        bigint      NOT NULL DEFAULT 0,
+    -- Sum of this account's pending holds. Available = balance - held.
+    held           bigint      NOT NULL DEFAULT 0 CONSTRAINT held_nonnegative CHECK (held >= 0),
     created_at     timestamptz NOT NULL DEFAULT now(),
     UNIQUE (id, currency),
-    CONSTRAINT balance_floor CHECK (allow_negative OR balance >= 0)
+    CONSTRAINT balance_floor CHECK (allow_negative OR balance - held >= 0)
 );
+
+-- Upgrade a database created before holds existed.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = current_schema() AND table_name = 'accounts' AND column_name = 'held') THEN
+        ALTER TABLE accounts ADD COLUMN held bigint NOT NULL DEFAULT 0 CONSTRAINT held_nonnegative CHECK (held >= 0);
+        ALTER TABLE accounts DROP CONSTRAINT balance_floor,
+                             ADD CONSTRAINT balance_floor CHECK (allow_negative OR balance - held >= 0);
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS transactions (
     id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -85,12 +100,13 @@ CREATE TRIGGER entries_apply
 -- trigger depth 2; a direct UPDATE runs at depth 1.
 CREATE OR REPLACE FUNCTION ledger_guard_balance() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-    IF TG_OP = 'INSERT' AND NEW.balance <> 0 THEN
-        RAISE EXCEPTION 'accounts open at balance 0; post a transaction to fund one'
+    IF TG_OP = 'INSERT' AND (NEW.balance <> 0 OR NEW.held <> 0) THEN
+        RAISE EXCEPTION 'accounts open at balance 0 with nothing held; post a transaction to fund one'
             USING ERRCODE = 'check_violation';
     END IF;
-    IF TG_OP = 'UPDATE' AND NEW.balance IS DISTINCT FROM OLD.balance AND pg_trigger_depth() < 2 THEN
-        RAISE EXCEPTION 'balance is derived from entries; post a transaction instead'
+    IF TG_OP = 'UPDATE' AND pg_trigger_depth() < 2
+       AND (NEW.balance IS DISTINCT FROM OLD.balance OR NEW.held IS DISTINCT FROM OLD.held) THEN
+        RAISE EXCEPTION 'balance and held are derived from entries and holds; post a transaction instead'
             USING ERRCODE = 'check_violation';
     END IF;
     RETURN NEW;
@@ -198,6 +214,139 @@ CREATE TRIGGER transactions_one_live_ref
     FOR EACH ROW EXECUTE FUNCTION ledger_one_live_ref();
 
 
+-- ------------------------------------------------------------------ holds
+-- A hold reserves money now and moves it later: a card authorisation, a UPI
+-- mandate, a hotel pre-auth. While pending it lowers the account's available
+-- balance (balance - held) without moving anything. It ends exactly once:
+--   captured  money moves to the payee (all of it, or less: a partial capture)
+--   voided    released, nothing moves
+--   expired   released by the expiry job after expires_at
+CREATE TABLE IF NOT EXISTS holds (
+    id                     bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    client_id              text        NOT NULL CHECK (length(client_id) BETWEEN 1 AND 100),
+    idempotency_key        text        NOT NULL CHECK (length(idempotency_key) BETWEEN 1 AND 255),
+    request_hash           text        NOT NULL,
+    account_id             bigint      NOT NULL,
+    payee_id               bigint      NOT NULL,
+    currency               char(3)     NOT NULL,
+    amount                 bigint      NOT NULL CHECK (amount > 0),
+    status                 text        NOT NULL DEFAULT 'pending'
+                           CHECK (status IN ('pending', 'captured', 'voided', 'expired')),
+    captured_amount        bigint      CHECK (captured_amount > 0 AND captured_amount <= amount),
+    capture_transaction_id bigint      UNIQUE REFERENCES transactions (id),
+    expires_at             timestamptz NOT NULL,
+    created_at             timestamptz NOT NULL DEFAULT now(),
+    resolved_at            timestamptz,
+    UNIQUE (client_id, idempotency_key),
+    FOREIGN KEY (account_id, currency) REFERENCES accounts (id, currency),
+    FOREIGN KEY (payee_id, currency)   REFERENCES accounts (id, currency),
+    CHECK (account_id <> payee_id),
+    CHECK (expires_at > created_at),
+    CHECK ((status = 'captured') = (capture_transaction_id IS NOT NULL AND captured_amount IS NOT NULL)),
+    CHECK ((status = 'pending') = (resolved_at IS NULL))
+);
+
+CREATE INDEX IF NOT EXISTS holds_pending_expiry_idx ON holds (expires_at) WHERE status = 'pending';
+
+
+-- A hold changes state once, from pending, and nothing but its resolution
+-- may change. The clock rules live here too, so no code path can capture an
+-- expired hold or expire a live one.
+CREATE OR REPLACE FUNCTION ledger_hold_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'holds are never deleted; void one instead' USING ERRCODE = 'restrict_violation';
+    END IF;
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.status <> 'pending' THEN
+            RAISE EXCEPTION 'a hold starts pending' USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF OLD.status <> 'pending' THEN
+        RAISE EXCEPTION 'hold % is already %', OLD.id, OLD.status USING ERRCODE = 'restrict_violation';
+    END IF;
+    IF NEW.status = 'pending' THEN
+        RAISE EXCEPTION 'an update to hold % must resolve it', OLD.id USING ERRCODE = 'restrict_violation';
+    END IF;
+    IF (NEW.id, NEW.client_id, NEW.idempotency_key, NEW.request_hash, NEW.account_id, NEW.payee_id,
+        NEW.currency, NEW.amount, NEW.expires_at, NEW.created_at)
+       IS DISTINCT FROM
+       (OLD.id, OLD.client_id, OLD.idempotency_key, OLD.request_hash, OLD.account_id, OLD.payee_id,
+        OLD.currency, OLD.amount, OLD.expires_at, OLD.created_at) THEN
+        RAISE EXCEPTION 'only the resolution of hold % can change', OLD.id USING ERRCODE = 'restrict_violation';
+    END IF;
+    IF NEW.status = 'captured' AND now() >= OLD.expires_at THEN
+        RAISE EXCEPTION 'hold % expired at %', OLD.id, OLD.expires_at USING ERRCODE = 'check_violation';
+    END IF;
+    IF NEW.status = 'expired' AND now() < OLD.expires_at THEN
+        RAISE EXCEPTION 'hold % does not expire until %', OLD.id, OLD.expires_at USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS holds_guard ON holds;
+CREATE TRIGGER holds_guard
+    BEFORE INSERT OR UPDATE OR DELETE ON holds
+    FOR EACH ROW EXECUTE FUNCTION ledger_hold_guard();
+
+
+-- accounts.held is derived from pending holds, the same way balance is
+-- derived from entries. Opening a hold raises it; resolving one lowers it.
+CREATE OR REPLACE FUNCTION ledger_hold_apply() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        UPDATE accounts SET held = held + NEW.amount WHERE id = NEW.account_id;
+    ELSIF OLD.status = 'pending' AND NEW.status <> 'pending' THEN
+        UPDATE accounts SET held = held - OLD.amount WHERE id = OLD.account_id;
+    END IF;
+    RETURN NULL;
+END $$;
+
+DROP TRIGGER IF EXISTS holds_apply ON holds;
+CREATE TRIGGER holds_apply
+    AFTER INSERT OR UPDATE ON holds
+    FOR EACH ROW EXECUTE FUNCTION ledger_hold_apply();
+
+
+-- At COMMIT, a captured hold must point at a transaction that moved exactly
+-- captured_amount from the hold's account to its payee. Without this, the app
+-- role could mark a hold captured against any transaction and release the
+-- reservation without paying the payee.
+CREATE OR REPLACE FUNCTION ledger_check_capture() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.status <> 'captured' THEN
+        RETURN NULL;
+    END IF;
+    IF (SELECT array_agg(ARRAY[account_id, amount] ORDER BY account_id, amount)
+        FROM entries WHERE transaction_id = NEW.capture_transaction_id)
+       IS DISTINCT FROM
+       (SELECT array_agg(ARRAY[a, m] ORDER BY a, m)
+        FROM (VALUES (NEW.account_id, -NEW.captured_amount), (NEW.payee_id, NEW.captured_amount)) v (a, m)) THEN
+        RAISE EXCEPTION 'hold % is marked captured but transaction % does not move % from account % to %',
+            NEW.id, NEW.capture_transaction_id, NEW.captured_amount, NEW.account_id, NEW.payee_id
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NULL;
+END $$;
+
+DROP TRIGGER IF EXISTS holds_capture_matches ON holds;
+CREATE CONSTRAINT TRIGGER holds_capture_matches
+    AFTER UPDATE ON holds
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION ledger_check_capture();
+
+
+CREATE OR REPLACE VIEW ledger_held_drift AS
+SELECT a.id, a.name, a.held,
+       coalesce(sum(h.amount) FILTER (WHERE h.status = 'pending'), 0) AS pending_sum
+FROM accounts a
+LEFT JOIN holds h ON h.account_id = a.id
+GROUP BY a.id
+HAVING a.held <> coalesce(sum(h.amount) FILTER (WHERE h.status = 'pending'), 0);
+
+
 -- Row locks for a posting, taken in id order so opposite transfers queue
 -- instead of deadlocking. SECURITY DEFINER because SELECT ... FOR UPDATE
 -- needs UPDATE privilege, which the app role deliberately does not have.
@@ -238,5 +387,13 @@ GRANT INSERT (client_id, idempotency_key, request_hash, currency, memo, external
     ON transactions TO ledger_app;
 GRANT INSERT (transaction_id, account_id, currency, amount) ON entries TO ledger_app;
 
-REVOKE ALL ON FUNCTION ledger_apply_entry(), ledger_lock_accounts(bigint[]) FROM PUBLIC;
+-- Holds: the app opens them, and resolves them by changing only the
+-- resolution columns. The guard trigger decides which changes are legal.
+REVOKE ALL ON holds, ledger_held_drift FROM PUBLIC, ledger_app;
+GRANT SELECT ON holds, ledger_held_drift TO ledger_app;
+GRANT INSERT (client_id, idempotency_key, request_hash, account_id, payee_id, currency, amount, expires_at)
+    ON holds TO ledger_app;
+GRANT UPDATE (status, captured_amount, capture_transaction_id, resolved_at) ON holds TO ledger_app;
+
+REVOKE ALL ON FUNCTION ledger_apply_entry(), ledger_hold_apply(), ledger_lock_accounts(bigint[]) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION ledger_lock_accounts(bigint[]) TO ledger_app;

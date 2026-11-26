@@ -14,6 +14,7 @@ go negative. Settlement accounts and mints are made by the owner with
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, Query, Request, Response
@@ -47,6 +48,22 @@ class TransferIn(BaseModel):
     amount: Amount
     memo: Annotated[str | None, Field(max_length=500)] = None
     external_ref: Annotated[str | None, Field(max_length=200)] = None
+
+
+class HoldIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    account: int
+    payee: int
+    amount: Amount
+    expires_in_seconds: Annotated[int, Field(strict=True, ge=60, le=int(core.MAX_HOLD_TTL.total_seconds()))] = \
+        int(core.DEFAULT_HOLD_TTL.total_seconds())
+
+
+class CaptureIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    amount: Amount | None = None  # omit to capture the whole hold
 
 
 def create_app(pool: ConnectionPool | None = None) -> FastAPI:
@@ -103,6 +120,32 @@ def create_app(pool: ConnectionPool | None = None) -> FastAPI:
                             client_id: ClientId, c=Depends(conn)):
         result = core.reverse(c, client=client_id, key=idempotency_key, transaction_id=transaction_id)
         return posted(c, result, response)
+
+    @app.post("/holds", status_code=201)
+    def create_hold(body: HoldIn, response: Response, idempotency_key: IdempotencyKey,
+                    client_id: ClientId, c=Depends(conn)):
+        result = core.authorize(c, client=client_id, key=idempotency_key, account=body.account,
+                                payee=body.payee, amount=body.amount,
+                                expires_in=timedelta(seconds=body.expires_in_seconds))
+        if result.replayed:
+            response.status_code = 200
+            response.headers["Idempotent-Replayed"] = "true"
+        return core.get_hold(c, result.hold_id)
+
+    @app.get("/holds/{hold_id}")
+    def get_hold(hold_id: int, c=Depends(conn)):
+        return core.get_hold(c, hold_id)
+
+    @app.post("/holds/{hold_id}/capture", status_code=201)
+    def capture_hold(hold_id: int, response: Response, idempotency_key: IdempotencyKey,
+                     client_id: ClientId, body: CaptureIn | None = None, c=Depends(conn)):
+        result = core.capture(c, client=client_id, key=idempotency_key, hold_id=hold_id,
+                              amount=body.amount if body else None)
+        return posted(c, result, response)
+
+    @app.post("/holds/{hold_id}/void")
+    def void_hold(hold_id: int, c=Depends(conn)):
+        return core.void(c, hold_id=hold_id)
 
     @app.get("/health")
     def health(c=Depends(conn)):

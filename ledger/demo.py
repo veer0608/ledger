@@ -62,10 +62,33 @@ def main() -> int:
         # Waive the fee: a reversal, not an edit.
         core.reverse(conn, client="wallet-app", key="waive-fee-1", transaction_id=fee.transaction_id)
 
-        print("balances")
-        for acct in (bank, asha, ravi, fees):
+        # Card-style holds. Asha checks in to a hotel: 2,000 pre-authorised,
+        # 1,800 captured at checkout, the rest released. Ravi books a ride
+        # for 120 and cancels it. A third hold is still open at day end.
+        hotel = core.create_account(conn, "merchant:hotel", "INR")["id"]
+        rides = core.create_account(conn, "merchant:rides", "INR")["id"]
+
+        def h(key, payer, payee, rupees):
+            return core.authorize(conn, client="wallet-app", key=key, account=payer, payee=payee,
+                                  amount=recon.to_minor(rupees)).hold_id
+
+        stay = h("preauth-hotel-1", asha, hotel, "2000")
+        core.capture(conn, client="wallet-app", key="checkout-hotel-1", hold_id=stay,
+                     amount=recon.to_minor("1800"))
+        ride = h("ride-1", ravi, rides, "120")
+        core.void(conn, hold_id=ride)
+        h("ride-2", ravi, rides, "95")
+        try:
+            h("ride-3", ravi, rides, "1300")  # 1,300 balance but only 1,205 available
+        except core.InsufficientFunds as exc:
+            print(f"hold refused (amounts in paise): {exc}")
+
+        print("balances (held is reserved by open holds; available = balance - held)")
+        print(f"  {'':<14} {'balance':>10} {'held':>8} {'available':>10}")
+        for acct in (bank, asha, ravi, fees, hotel, rides):
             a = core.get_account(conn, acct)
-            print(f"  {a['name']:<14} {recon.fmt(a['balance']):>10}")
+            print(f"  {a['name']:<14} {recon.fmt(a['balance']):>10} {recon.fmt(a['held']):>8}"
+                  f" {recon.fmt(a['available']):>10}")
         health = core.check_invariants(conn)
         print(f"invariants ok: {health['ok']}")
 

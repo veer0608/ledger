@@ -3,7 +3,8 @@
 A double-entry ledger on Postgres: the part of a payments company that decides
 whether money moved. Transfers are idempotent, balances stay correct under
 concurrent load, history is append-only, a bank reference is credited at most
-once, and a reconciliation job checks the ledger against a bank statement.
+once, money can be held and captured later the way a card authorisation works,
+and a reconciliation job checks the ledger against a bank statement.
 
 The rules that keep money correct live in the database, not only in Python.
 They are claimed against **the role the service connects as** (`ledger_app`):
@@ -26,6 +27,10 @@ can disable any trigger.
 | History cannot be edited or wiped | no `UPDATE`/`DELETE`/`TRUNCATE` grant; row triggers also stop the owner's edits | `test_app_role_is_refused[truncate history]` |
 | The app cannot make a mint | column-level `INSERT` grant excludes `allow_negative` | `test_app_role_is_refused[open a mint]` |
 | No currency mixing | composite foreign keys tie each entry's currency to its account and transaction | `test_entry_currency_must_match_account` |
+| Money on hold cannot be spent | the balance floor is `balance - held >= 0`; `held` is derived from pending holds by trigger | `test_holds::test_holds_and_transfers_race_for_the_same_money` |
+| A hold resolves exactly once | guard trigger allows only pending to captured, voided or expired | `test_capture_versus_void_race` |
+| A capture pays exactly what it says to the hold's payee | deferred trigger checks the capture transaction's entries at COMMIT | `test_capture_without_paying_the_payee_is_refused` |
+| An expired hold cannot be captured | the guard trigger compares `expires_at` to the database clock | `test_expired_hold_cannot_be_captured_and_is_released_by_the_job` |
 
 Amounts are `bigint` paise everywhere. There is no float in the schema, the
 code, or the API (the API rejects `1.5`, `1.0`, `"100"` and `true`).
@@ -58,6 +63,12 @@ protection is removed. Each one was checked by breaking the code on purpose:
 | Remove the replay check on a duplicate reference | 19 of 20 identical retries are refused instead of replayed |
 | Run the guard tests as the owner instead of `ledger_app` | 16 of 24 fail: the role is doing the work |
 | Remove the application's funds check | **all tests still pass**: the database `CHECK` stops the overdraft by itself |
+| `void` locks the hold before the account | 8 to 19 of 20 racing captures and voids die with `DeadlockDetected` (three runs) |
+| `capture` debits before releasing the hold | a hold on the whole balance can no longer be captured |
+| Remove the deferred capture-matches check | a hold can be marked captured against an unrelated transaction |
+| `authorize` skips the replay check after taking the lock | 18 of 20 identical retries are refused for lack of the money the first one reserved |
+| `capture` skips its own expiry check | still refused: the database guard raises instead, with a less friendly error |
+| `authorize` skips its funds check | **all tests still pass**: the balance floor refuses the hold |
 
 One of these needed a second test. The first duplicate-UTR race sent all 20
 deposits between the same two accounts. The account row locks serialised them
@@ -71,6 +82,29 @@ balance non-negative.
 
 The tests run real concurrent sessions: each thread takes its own connection
 and all of them are released at once from a barrier.
+
+## Holds
+
+A hold reserves money now and moves it later: a card authorisation, a UPI
+mandate, a hotel pre-auth. While it is pending, the account's `held` goes up
+and `available` (`balance - held`) goes down, but nothing moves. It ends
+exactly once:
+
+| Ending | What happens |
+|---|---|
+| `captured` | money moves to the payee named when the hold was opened. Capturing less than the hold is a partial capture: the rest is released |
+| `voided` | released, nothing moves. Voiding twice is a no-op, so retries are safe |
+| `expired` | released by `python -m ledger.jobs expire-holds`, run on a schedule |
+
+A refund after capture is an ordinary reversal of the capture transaction.
+
+Every path takes locks in the same order, accounts then the hold. A `void`
+that took them the other way round (the hold first, then the account through
+the held-balance trigger) deadlocks against a concurrent capture; the
+mutation table above shows the race test catching it. Between a hold
+lapsing and the job running, the money stays reserved. That errs the safe way:
+reserved a little too long, never released early. A lapsed hold cannot be
+captured either way, because the database checks the clock itself.
 
 ## Reconciliation
 
@@ -106,17 +140,22 @@ python -m venv .venv
 
 The demo runs a day of a small wallet business (deposits, a payment between
 users, a fee and its reversal, withdrawals, a retried deposit that replays, a
-redelivered webhook that is refused) and reconciles it against a statement
+redelivered webhook that is refused, a hotel pre-auth captured for less, a
+cancelled ride, a ride still on hold) and reconciles it against a statement
 with problems planted in it:
 
 ```
 app role refused a mint: only the database owner can create an account that may go negative
 redelivered webhook refused: external_ref UTR001 is already posted as transaction 1
-balances
-  bank:hdfc        -6150.00
-  wallet:asha       4850.00
-  wallet:ravi       1300.00
-  revenue:fees         0.00
+hold refused (amounts in paise): account 3 has 120500 available and cannot hold 130000
+balances (held is reserved by open holds; available = balance - held)
+                    balance     held  available
+  bank:hdfc        -6150.00     0.00   -6150.00
+  wallet:asha       3050.00     0.00    3050.00
+  wallet:ravi       1300.00    95.00    1205.00
+  revenue:fees         0.00     0.00       0.00
+  merchant:hotel    1800.00     0.00    1800.00
+  merchant:rides       0.00     0.00       0.00
 invariants ok: True
 
 reconciliation of bank:hdfc
@@ -132,8 +171,8 @@ reconciliation of bank:hdfc
 
 `bank:hdfc` is negative because it is the outside world's side of the bank
 account: money that came in through the bank is a transfer out of it. Its
-balance is minus what the bank should be holding for the wallets: 6,150.00,
-the sum of the three wallet balances.
+balance is minus what the bank should be holding for everyone else: 6,150.00,
+the sum of every other account's balance.
 
 ### Deploying
 
@@ -161,6 +200,10 @@ set, all of this happens automatically against the bundled Postgres.
 | `GET /accounts/{id}/statement` | entries with running balance |
 | `POST /transfers` | requires `Idempotency-Key` and `Client-Id`; 201 when new, 200 plus `Idempotent-Replayed: true` on a retry, 409 for a reused key or an already-posted `external_ref` |
 | `POST /transactions/{id}/reverse` | requires `Idempotency-Key` and `Client-Id` |
+| `POST /holds` | `{account, payee, amount, expires_in_seconds}`; requires `Idempotency-Key` and `Client-Id`; default expiry 7 days, at most 30 |
+| `GET /holds/{id}` | status, amounts, expiry, `lapsed` |
+| `POST /holds/{id}/capture` | optional `{amount}` for a partial capture; requires `Idempotency-Key` and `Client-Id`; returns the transaction |
+| `POST /holds/{id}/void` | release; 409 if already captured or expired |
 | `GET /health` | full invariant audit; 500 if anything disagrees |
 
 ## Decisions
@@ -204,10 +247,11 @@ Measured or seen, not fixed:
 
 ```
 ledger/schema.sql   tables, triggers, roles and grants, the drift view
-ledger/core.py      transfer, reverse, statement, invariant audit
+ledger/core.py      transfer, reverse, holds, statement, invariant audit
 ledger/api.py       FastAPI
 ledger/recon.py     statement parser and two-pass matcher
 ledger/migrate.py   owner-side setup and system accounts
+ledger/jobs.py      scheduled jobs (hold expiry)
 ledger/demo.py      end-to-end run
-tests/              106 tests: core, raw-SQL attacks as the app role, races, API, reconciliation
+tests/              148 tests: core, holds, raw-SQL attacks as the app role, races, API, reconciliation
 ```
