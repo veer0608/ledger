@@ -117,18 +117,35 @@ there are. A shard group splits that account into several rows
 .venv\Scripts\python -m ledger.migrate --system-account bank:hdfc INR --shards 8
 ```
 
-`python -m ledger.bench`, 20 threads, 3,000 deposits a round, median of 5
-rounds, local Postgres:
+A posting holds its row locks across several round trips to Postgres, so
+the one-account ceiling is set by network latency more than by Postgres.
+`python -m ledger.bench --rtt-ms 0,0.01,5` puts a delaying TCP proxy between
+the app and the database and reports the round trip it actually measured.
+20 threads, 1,000 deposits a round, median of 3 rounds, transfers/s:
 
-| Deposits come from | transfers/s | rounds |
-|---|---|---|
-| one settlement account | 965 | 838 to 971 |
-| a group of 8 shards | 1,209 | 1,183 to 1,312 |
-| no shared account at all (the ceiling) | 1,325 | 1,295 to 1,338 |
+| Round trip (measured) | one settlement account | 8 shards | no shared account | shards vs one |
+|---|---|---|---|---|
+| 0.08 ms (direct) | 553 | 898 | 873 | 1.6x |
+| 3.0 ms | 151 | 624 | 646 | 4.1x |
+| 7.0 ms | 88 | 632 | 619 | 7.2x |
 
-Sharding recovers about two thirds of the gap to the no-contention ceiling
-on this machine. An earlier 3-round run put the shards level with the
-ceiling (1,350 against 1,272); run to run noise here is roughly 10%.
+How to read it:
+
+- **The one-account column is the problem.** Every added millisecond of
+  round trip is a millisecond the bank row stays locked, so it falls from
+  553 to 88. The shards barely move.
+- **At 3 ms and above, the shards and the no-shared-account column both sit
+  near 620 to 650.** That is this harness's own limit (one Python process
+  and the proxy), not Postgres's, so read those rows as "the shards removed
+  the contention", not as a throughput figure.
+- **The proxy cannot go below about 3 ms.** Asking for 0.5, 1 or 2 ms all
+  measured 2.98 ms, because sleeps round up even with the Windows timer at
+  1 ms (at the default 15.6 ms, a requested 1 ms came out as 31). Same-region
+  cloud round trips of 0.2 to 1 ms fall between the first two rows and are
+  not measured here.
+- **Absolute numbers move with machine load.** The day before, a direct run
+  of 3,000 deposits a round measured 965, 1,209 and 1,325. Compare columns
+  within one row, not across runs.
 
 The details that make it safe:
 
@@ -273,10 +290,9 @@ Measured or seen, not fixed:
   receives thousands of payments is also a hot row, but it has a balance
   floor, and checking a floor across shards needs the group total under a
   lock: the contention sharding removes. Not solved here.
-- **The benchmark runs against a local Postgres**, where a round trip costs
-  almost nothing. A posting holds its locks across several round trips, so
-  over a real network the single-account ceiling should fall and the gain
-  from sharding grow. That is expected, not measured.
+- **Latency is simulated, not real.** The benchmark's proxy adds delay on one
+  machine; it is not a network between two hosts, and it cannot simulate
+  round trips under about 3 ms.
 - **`Client-Id` is trusted as sent.** It keeps honest clients' keys apart. It
   does not stop one client claiming to be another; that is the auth layer's job.
 - **The schema is re-applied on local startup**, which briefly locks tables.
