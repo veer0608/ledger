@@ -1,0 +1,9 @@
+[project]
+name = "ledger"
+version = "0.1.0"
+description = "A double-entry ledger on Postgres: balanced transactions, idempotent transfers, race-safe balances, bank reconciliation."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

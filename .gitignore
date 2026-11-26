@@ -1,0 +1,7 @@
+.venv/
+.pgdata/
+__pycache__/
+.pytest_cache/
+demo/
+recon_report.csv
+.env
