@@ -192,9 +192,9 @@ def load_ledger(conn, account_name: str, start: date, end: date) -> list[LedgerL
            FROM entries e
            JOIN transactions t ON t.id = e.transaction_id
            JOIN accounts a ON a.id = e.account_id
-           WHERE a.name = %s AND e.created_at >= %s AND e.created_at < %s
+           WHERE (a.name = %s OR a.shard_group = %s) AND e.created_at >= %s AND e.created_at < %s
            ORDER BY e.id""",
-        (account_name, lo, hi),
+        (account_name, account_name, lo, hi),
     ).fetchall()
     return [LedgerLine(eid, tid, ts.astimezone(LOCAL_TZ).date(), amt, ref)
             for eid, tid, ts, amt, ref in rows]
@@ -208,8 +208,9 @@ def run(conn, statement: Path, account_name: str, start: date, end: date,
         window_days: int = 2) -> list[Result]:
     if end < start:
         raise ValueError(f"period ends ({end}) before it starts ({start})")
-    if not conn.execute("SELECT 1 FROM accounts WHERE name = %s", (account_name,)).fetchone():
-        raise ValueError(f"no ledger account named {account_name!r}")
+    if not conn.execute("SELECT 1 FROM accounts WHERE name = %s OR shard_group = %s",
+                        (account_name, account_name)).fetchone():
+        raise ValueError(f"no ledger account or shard group named {account_name!r}")
     bank = read_statement(statement)
     outside = [b for b in bank if not start <= b.date <= end]
     if outside:
@@ -260,7 +261,8 @@ def main(argv: list[str] | None = None) -> int:
 
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("statement", type=Path)
-    ap.add_argument("--account", required=True, help="ledger settlement account name, e.g. bank:hdfc")
+    ap.add_argument("--account", required=True,
+                    help="ledger settlement account or shard group name, e.g. bank:hdfc")
     ap.add_argument("--from", dest="start", required=True, type=date.fromisoformat,
                     help="first day of the statement period, YYYY-MM-DD")
     ap.add_argument("--to", dest="end", required=True, type=date.fromisoformat,

@@ -15,13 +15,16 @@ import argparse
 
 import psycopg
 
-from . import db
+from . import core, db
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Apply the ledger schema as the owner role.")
     ap.add_argument("--system-account", nargs=2, action="append", default=[],
                     metavar=("NAME", "CURRENCY"), help="create an allow_negative account (repeatable)")
+    ap.add_argument("--shards", type=int, default=1,
+                    help="split each --system-account into this many shards, NAME#0..NAME#N-1, "
+                         "for an account so busy its row lock is the bottleneck")
     args = ap.parse_args(argv)
 
     owner = db.database_url()
@@ -29,6 +32,13 @@ def main(argv: list[str] | None = None) -> int:
     print("schema applied; ledger_app can log in")
     with psycopg.connect(owner, autocommit=True) as conn:
         for name, currency in args.system_account:
+            if args.shards > 1:
+                if conn.execute("SELECT 1 FROM accounts WHERE shard_group = %s", (name,)).fetchone():
+                    print(f"shard group {name}: already exists")
+                else:
+                    ids = core.create_shard_group(conn, name, currency, args.shards)
+                    print(f"shard group {name}: created {len(ids)} shards, ids {ids[0]}..{ids[-1]}")
+                continue
             row = conn.execute(
                 """INSERT INTO accounts (name, currency, allow_negative) VALUES (%s, %s, true)
                    ON CONFLICT (name) DO NOTHING RETURNING id""",

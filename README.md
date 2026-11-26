@@ -106,6 +106,43 @@ lapsing and the job running, the money stays reserved. That errs the safe way:
 reserved a little too long, never released early. A lapsed hold cannot be
 captured either way, because the database checks the clock itself.
 
+## Busy accounts: shard groups
+
+Every deposit debits the bank settlement account, so every deposit wants the
+same row lock. Postings to it queue one behind another however many workers
+there are. A shard group splits that account into several rows
+(`bank:hdfc#0` to `bank:hdfc#7`), and each posting picks one:
+
+```powershell
+.venv\Scripts\python -m ledger.migrate --system-account bank:hdfc INR --shards 8
+```
+
+`python -m ledger.bench`, 20 threads, 3,000 deposits a round, median of 5
+rounds, local Postgres:
+
+| Deposits come from | transfers/s | rounds |
+|---|---|---|
+| one settlement account | 965 | 838 to 971 |
+| a group of 8 shards | 1,209 | 1,183 to 1,312 |
+| no shared account at all (the ceiling) | 1,325 | 1,295 to 1,338 |
+
+Sharding recovers about two thirds of the gap to the no-contention ceiling
+on this machine. An earlier 3-round run put the shards level with the
+ceiling (1,350 against 1,272); run to run noise here is roughly 10%.
+
+The details that make it safe:
+
+- **The shard is picked by a hash of (client, key), not at random.** A retry
+  must land on the same shard to replay. Picked at random, a retry would go
+  to a different shard, its request hash would differ, and it would fail as
+  an idempotency conflict.
+- **Only accounts that may go negative can be shards** (a `CHECK` enforces
+  it). They have no balance floor, so no posting ever needs the group's total.
+- **The UTR rule still spans the group**, since it is keyed on the reference,
+  not the account. A test sends two deliveries of one UTR to different shards.
+- **Reconciliation takes the group name** and reads every shard;
+  `GET /groups/{name}` returns the total.
+
 ## Reconciliation
 
 ```powershell
@@ -198,7 +235,8 @@ set, all of this happens automatically against the bundled Postgres.
 | `POST /accounts` | create an account (never one that may go negative) |
 | `GET /accounts/{id}` | balance |
 | `GET /accounts/{id}/statement` | entries with running balance |
-| `POST /transfers` | requires `Idempotency-Key` and `Client-Id`; 201 when new, 200 plus `Idempotent-Replayed: true` on a retry, 409 for a reused key or an already-posted `external_ref` |
+| `POST /transfers` | requires `Idempotency-Key` and `Client-Id`; each side is `from_account`/`to_account` (an id) or `from_group`/`to_group` (a shard group); 201 when new, 200 plus `Idempotent-Replayed: true` on a retry, 409 for a reused key or an already-posted `external_ref` |
+| `GET /groups/{name}` | a shard group's total balance |
 | `POST /transactions/{id}/reverse` | requires `Idempotency-Key` and `Client-Id` |
 | `POST /holds` | `{account, payee, amount, expires_in_seconds}`; requires `Idempotency-Key` and `Client-Id`; default expiry 7 days, at most 30 |
 | `GET /holds/{id}` | status, amounts, expiry, `lapsed` |
@@ -231,11 +269,14 @@ set, all of this happens automatically against the bundled Postgres.
 
 Measured or seen, not fixed:
 
-- **A busy settlement account is a bottleneck.** Every deposit locks the one
-  `bank:hdfc` row: 703 transfers/s through it against 1,106 spread across
-  accounts (local, 20 threads). The limit is how long that lock is held, so a
-  network round trip per statement lowers it further. The usual fixes are
-  splitting the settlement account or not locking accounts that may go negative.
+- **Only negative-capable accounts can be sharded.** A busy merchant that
+  receives thousands of payments is also a hot row, but it has a balance
+  floor, and checking a floor across shards needs the group total under a
+  lock: the contention sharding removes. Not solved here.
+- **The benchmark runs against a local Postgres**, where a round trip costs
+  almost nothing. A posting holds its locks across several round trips, so
+  over a real network the single-account ceiling should fall and the gain
+  from sharding grow. That is expected, not measured.
 - **`Client-Id` is trusted as sent.** It keeps honest clients' keys apart. It
   does not stop one client claiming to be another; that is the auth layer's job.
 - **The schema is re-applied on local startup**, which briefly locks tables.
@@ -252,6 +293,7 @@ ledger/api.py       FastAPI
 ledger/recon.py     statement parser and two-pass matcher
 ledger/migrate.py   owner-side setup and system accounts
 ledger/jobs.py      scheduled jobs (hold expiry)
+ledger/bench.py     throughput: one account vs a shard group vs none
 ledger/demo.py      end-to-end run
-tests/              148 tests: core, holds, raw-SQL attacks as the app role, races, API, reconciliation
+tests/              162 tests: core, holds, shard groups, raw-SQL attacks as the app role, races, API, reconciliation
 ```

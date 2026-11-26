@@ -21,7 +21,7 @@ from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from psycopg_pool import ConnectionPool
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from . import core, db
 
@@ -43,11 +43,21 @@ class AccountIn(BaseModel):
 class TransferIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    from_account: int
-    to_account: int
+    # Each side is an account id, or a shard group name for a busy system account.
+    from_account: int | None = None
+    from_group: Annotated[str | None, Field(min_length=1, max_length=200)] = None
+    to_account: int | None = None
+    to_group: Annotated[str | None, Field(min_length=1, max_length=200)] = None
     amount: Amount
     memo: Annotated[str | None, Field(max_length=500)] = None
     external_ref: Annotated[str | None, Field(max_length=200)] = None
+
+    @model_validator(mode="after")
+    def one_per_side(self):
+        for side in ("from", "to"):
+            if (getattr(self, f"{side}_account") is None) == (getattr(self, f"{side}_group") is None):
+                raise ValueError(f"give exactly one of {side}_account or {side}_group")
+        return self
 
 
 class HoldIn(BaseModel):
@@ -99,6 +109,10 @@ def create_app(pool: ConnectionPool | None = None) -> FastAPI:
     def get_account(account_id: int, c=Depends(conn)):
         return core.get_account(c, account_id)
 
+    @app.get("/groups/{name}")
+    def get_group(name: str, c=Depends(conn)):
+        return core.group_balance(c, name)
+
     @app.get("/accounts/{account_id}/statement")
     def get_statement(account_id: int, limit: Annotated[int, Query(ge=1, le=1000)] = 100, c=Depends(conn)):
         return core.statement(c, account_id, limit)
@@ -106,8 +120,12 @@ def create_app(pool: ConnectionPool | None = None) -> FastAPI:
     @app.post("/transfers", status_code=201)
     def create_transfer(body: TransferIn, response: Response, idempotency_key: IdempotencyKey,
                         client_id: ClientId, c=Depends(conn)):
-        result = core.transfer(c, client=client_id, key=idempotency_key, from_account=body.from_account,
-                               to_account=body.to_account, amount=body.amount,
+        def side(account, group):
+            return account if group is None else core.shard_for(c, group, client=client_id, key=idempotency_key)
+
+        result = core.transfer(c, client=client_id, key=idempotency_key,
+                               from_account=side(body.from_account, body.from_group),
+                               to_account=side(body.to_account, body.to_group), amount=body.amount,
                                memo=body.memo, external_ref=body.external_ref)
         return posted(c, result, response)
 

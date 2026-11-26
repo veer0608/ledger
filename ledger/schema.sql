@@ -27,10 +27,27 @@ CREATE TABLE IF NOT EXISTS accounts (
     balance        bigint      NOT NULL DEFAULT 0,
     -- Sum of this account's pending holds. Available = balance - held.
     held           bigint      NOT NULL DEFAULT 0 CONSTRAINT held_nonnegative CHECK (held >= 0),
+    -- Shards of one busy account share a group name (see "Shard groups" below).
+    shard_group    text,
     created_at     timestamptz NOT NULL DEFAULT now(),
     UNIQUE (id, currency),
-    CONSTRAINT balance_floor CHECK (allow_negative OR balance - held >= 0)
+    CONSTRAINT balance_floor CHECK (allow_negative OR balance - held >= 0),
+    CONSTRAINT shard_needs_negative CHECK (shard_group IS NULL OR allow_negative)
 );
+
+-- Shard groups: one busy account (a bank settlement account, a mint) split
+-- into several rows so concurrent postings lock different rows. Only for
+-- accounts that may go negative: they have no balance floor, so no posting
+-- ever needs the group's total under a lock.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = current_schema() AND table_name = 'accounts' AND column_name = 'shard_group') THEN
+        ALTER TABLE accounts ADD COLUMN shard_group text,
+                             ADD CONSTRAINT shard_needs_negative CHECK (shard_group IS NULL OR allow_negative);
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS accounts_shard_group_idx ON accounts (shard_group, id) WHERE shard_group IS NOT NULL;
 
 -- Upgrade a database created before holds existed.
 DO $$

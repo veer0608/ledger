@@ -121,8 +121,9 @@ def _check_amount(amount: object) -> None:
 
 # ---------------------------------------------------------------- accounts
 
-def create_account(conn, name: str, currency: str, allow_negative: bool = False) -> dict:
-    """allow_negative accounts (mints, settlement accounts) need the owner role."""
+def create_account(conn, name: str, currency: str, allow_negative: bool = False,
+                   shard_group: str | None = None) -> dict:
+    """allow_negative accounts (mints, settlement accounts) and shards need the owner role."""
     _check_text(name, "account name", 200, required=True)
     if not CURRENCY_RE.match(currency or ""):
         raise LedgerError("currency must be a 3-letter ISO code such as INR")
@@ -132,8 +133,12 @@ def create_account(conn, name: str, currency: str, allow_negative: bool = False)
     if allow_negative:
         cols.append("allow_negative")
         vals.append(True)
+    if shard_group is not None:
+        _check_text(shard_group, "shard group", 200, required=True)
+        cols.append("shard_group")
+        vals.append(shard_group)
     query = f"""INSERT INTO accounts ({", ".join(cols)}) VALUES ({", ".join(["%s"] * len(cols))})
-                RETURNING id, name, currency, allow_negative, balance, created_at"""
+                RETURNING id, name, currency, allow_negative, shard_group, balance, created_at"""
     try:
         return _cur(conn).execute(query, vals).fetchone()
     except errors.UniqueViolation:
@@ -144,12 +149,49 @@ def create_account(conn, name: str, currency: str, allow_negative: bool = False)
 
 def get_account(conn, account_id: int) -> dict:
     row = _cur(conn).execute(
-        """SELECT id, name, currency, allow_negative, balance, held, balance - held AS available, created_at
+        """SELECT id, name, currency, allow_negative, shard_group, balance, held,
+                  balance - held AS available, created_at
            FROM accounts WHERE id = %s""",
         (account_id,),
     ).fetchone()
     if row is None:
         raise NotFound(f"account {account_id} not found")
+    return row
+
+
+def create_shard_group(conn, name: str, currency: str, shards: int) -> list[int]:
+    """Owner only. Creates NAME#0 .. NAME#(shards-1), each allowed to go negative."""
+    if not isinstance(shards, int) or not 1 <= shards <= 64:
+        raise LedgerError("shards must be between 1 and 64")
+    with conn.transaction():
+        return [create_account(conn, f"{name}#{i}", currency, allow_negative=True, shard_group=name)["id"]
+                for i in range(shards)]
+
+
+def shard_for(conn, group: str, *, client: str, key: str) -> int:
+    """The shard a request posts to: a hash of (client, key), so a retry of
+    the same request always lands on the same shard and replays. Picking at
+    random would send the retry elsewhere and fail it as a key conflict.
+
+    If a group's shard count changes, an in-flight retry may route to a new
+    shard. It then fails as an idempotency conflict, never as a second posting.
+    """
+    shards = [r[0] for r in conn.execute(
+        "SELECT id FROM accounts WHERE shard_group = %s ORDER BY id", (group,))]
+    if not shards:
+        raise NotFound(f"shard group {group!r} not found")
+    digest = hashlib.sha256(f"{client}\x00{key}".encode()).digest()
+    return shards[int.from_bytes(digest[:8], "big") % len(shards)]
+
+
+def group_balance(conn, group: str) -> dict:
+    row = _cur(conn).execute(
+        """SELECT shard_group AS name, min(currency) AS currency, count(*) AS shards, sum(balance) AS balance
+           FROM accounts WHERE shard_group = %s GROUP BY shard_group""",
+        (group,),
+    ).fetchone()
+    if row is None:
+        raise NotFound(f"shard group {group!r} not found")
     return row
 
 
