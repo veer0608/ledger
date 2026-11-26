@@ -3,9 +3,13 @@
     uvicorn ledger.api:app
 
 There is no authentication: this is the ledger core, meant to sit behind a
-service that owns auth. In particular, anyone who can call POST /accounts can
-create an account with allow_negative, which is a money printer. Do not expose
-this directly.
+service that owns auth and sets the Client-Id header from it. Here the header
+is trusted as given, so it scopes idempotency keys between honest clients; it
+does not stop one client from claiming to be another.
+
+The service connects as ledger_app, which cannot create an account that may
+go negative. Settlement accounts and mints are made by the owner with
+`python -m ledger.migrate --system-account NAME CURRENCY`.
 """
 from __future__ import annotations
 
@@ -16,22 +20,28 @@ from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from psycopg_pool import ConnectionPool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import core, db
 
 # strict: 1.5, "100" and true are all rejected rather than coerced.
 Amount = Annotated[int, Field(strict=True, gt=0, le=core.MAX_AMOUNT)]
 IdempotencyKey = Annotated[str, Header(min_length=1, max_length=255)]
+ClientId = Annotated[str, Header(min_length=1, max_length=100)]
 
 
 class AccountIn(BaseModel):
+    # forbid: a request asking for allow_negative gets a 422, not a quiet
+    # normal account the caller then believes is a mint.
+    model_config = ConfigDict(extra="forbid")
+
     name: Annotated[str, Field(min_length=1, max_length=200)]
     currency: Annotated[str, Field(pattern=r"^[A-Z]{3}$")]
-    allow_negative: bool = False
 
 
 class TransferIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     from_account: int
     to_account: int
     amount: Amount
@@ -43,10 +53,7 @@ def create_app(pool: ConnectionPool | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         owned = pool is None
-        app.state.pool = pool or db.make_pool(db.database_url())
-        if owned:
-            with app.state.pool.connection() as conn:
-                db.apply_schema(conn)
+        app.state.pool = pool or db.make_pool(db.app_url())
         yield
         if owned:
             app.state.pool.close()
@@ -69,7 +76,7 @@ def create_app(pool: ConnectionPool | None = None) -> FastAPI:
 
     @app.post("/accounts", status_code=201)
     def create_account(body: AccountIn, c=Depends(conn)):
-        return core.create_account(c, body.name, body.currency, body.allow_negative)
+        return core.create_account(c, body.name, body.currency)
 
     @app.get("/accounts/{account_id}")
     def get_account(account_id: int, c=Depends(conn)):
@@ -81,8 +88,8 @@ def create_app(pool: ConnectionPool | None = None) -> FastAPI:
 
     @app.post("/transfers", status_code=201)
     def create_transfer(body: TransferIn, response: Response, idempotency_key: IdempotencyKey,
-                        c=Depends(conn)):
-        result = core.transfer(c, key=idempotency_key, from_account=body.from_account,
+                        client_id: ClientId, c=Depends(conn)):
+        result = core.transfer(c, client=client_id, key=idempotency_key, from_account=body.from_account,
                                to_account=body.to_account, amount=body.amount,
                                memo=body.memo, external_ref=body.external_ref)
         return posted(c, result, response)
@@ -93,8 +100,8 @@ def create_app(pool: ConnectionPool | None = None) -> FastAPI:
 
     @app.post("/transactions/{transaction_id}/reverse", status_code=201)
     def reverse_transaction(transaction_id: int, response: Response, idempotency_key: IdempotencyKey,
-                            c=Depends(conn)):
-        result = core.reverse(c, key=idempotency_key, transaction_id=transaction_id)
+                            client_id: ClientId, c=Depends(conn)):
+        result = core.reverse(c, client=client_id, key=idempotency_key, transaction_id=transaction_id)
         return posted(c, result, response)
 
     @app.get("/health")

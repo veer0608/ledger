@@ -9,7 +9,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 from ledger import core
-from tests.conftest import balance
+from tests.conftest import CLIENT, balance
 
 
 def run_together(pool, n, fn):
@@ -37,7 +37,7 @@ def test_overdraft_race_cannot_go_negative(pool, conn, make_account):
     a = make_account("alice", 1_000)
     b = make_account("bob")
     results = run_together(pool, 50, lambda c, i: core.transfer(
-        c, key=f"w{i}", from_account=a, to_account=b, amount=30))
+        c, client=CLIENT, key=f"w{i}", from_account=a, to_account=b, amount=30))
     counts = Counter(outcome(r) for r in results)
     assert counts == {"ok": 33, "InsufficientFunds": 17}, counts
     assert balance(conn, a) == 10
@@ -50,7 +50,7 @@ def test_same_key_storm_moves_money_once(pool, conn, make_account):
     a = make_account("alice", 1_000)
     b = make_account("bob")
     results = run_together(pool, 30, lambda c, i: core.transfer(
-        c, key="pay-123", from_account=a, to_account=b, amount=700))
+        c, client=CLIENT, key="pay-123", from_account=a, to_account=b, amount=700))
     assert all(isinstance(r, core.Posted) for r in results), Counter(map(outcome, results))
     assert len({r.transaction_id for r in results}) == 1
     assert sum(not r.replayed for r in results) == 1
@@ -65,7 +65,7 @@ def test_opposing_transfers_do_not_deadlock(pool, conn, make_account):
 
     def move(c, i):
         src, dst = (a, b) if i % 2 else (b, a)
-        return core.transfer(c, key=f"x{i}", from_account=src, to_account=dst, amount=7)
+        return core.transfer(c, client=CLIENT, key=f"x{i}", from_account=src, to_account=dst, amount=7)
 
     results = run_together(pool, 50, move)
     assert Counter(map(outcome, results)) == {"ok": 50}
@@ -76,8 +76,8 @@ def test_opposing_transfers_do_not_deadlock(pool, conn, make_account):
 def test_double_reversal_race(pool, conn, make_account):
     a = make_account("alice", 1_000)
     b = make_account("bob")
-    t = core.transfer(conn, key="t1", from_account=a, to_account=b, amount=500)
-    results = run_together(pool, 20, lambda c, i: core.reverse(c, key=f"r{i}", transaction_id=t.transaction_id))
+    t = core.transfer(conn, client=CLIENT, key="t1", from_account=a, to_account=b, amount=500)
+    results = run_together(pool, 20, lambda c, i: core.reverse(c, client=CLIENT, key=f"r{i}", transaction_id=t.transaction_id))
     assert Counter(map(outcome, results)) == {"ok": 1, "AlreadyReversed": 19}
     assert balance(conn, a) == 1_000
     assert balance(conn, b) == 0
@@ -97,7 +97,7 @@ def test_random_stress_conserves_money(pool, conn, make_account):
         out = []
         for key, src, dst, amt in plan[i::40]:
             try:
-                out.append(core.transfer(c, key=key, from_account=src, to_account=dst, amount=amt))
+                out.append(core.transfer(c, client=CLIENT, key=key, from_account=src, to_account=dst, amount=amt))
             except core.InsufficientFunds as exc:
                 out.append(exc)
         return out
@@ -110,3 +110,37 @@ def test_random_stress_conserves_money(pool, conn, make_account):
     assert sum(balance(conn, i) for i in ids) == total_before
     assert all(balance(conn, i) >= 0 for i in ids)
     assert core.check_invariants(conn)["ok"]
+
+
+def test_same_utr_race_credits_once(pool, conn, make_account):
+    # A webhook delivered 20 times at once, each with its own idempotency key.
+    bank = make_account("bank", allow_negative=True)
+    a = make_account("alice")
+    results = run_together(pool, 20, lambda c, i: core.transfer(
+        c, client=CLIENT, key=f"hook-{i}", from_account=bank, to_account=a, amount=500, external_ref="UTR42"))
+    assert Counter(map(outcome, results)) == {"ok": 1, "DuplicateReference": 19}
+    assert balance(conn, a) == 500
+
+
+def test_same_utr_race_across_unrelated_accounts(pool, conn, make_account):
+    # The test above is serialised by its shared account row locks before the
+    # reference check is reached. Here no two racers share an account, so the
+    # only thing standing between them is the reference rule's own lock.
+    pairs = [(make_account(f"bank{i}", allow_negative=True), make_account(f"w{i}")) for i in range(20)]
+    results = run_together(pool, 20, lambda c, i: core.transfer(
+        c, client=CLIENT, key=f"hook-{i}", from_account=pairs[i][0], to_account=pairs[i][1],
+        amount=500, external_ref="UTR44"))
+    assert Counter(map(outcome, results)) == {"ok": 1, "DuplicateReference": 19}
+    assert sum(balance(conn, w) for _, w in pairs) == 500
+
+
+def test_same_key_and_utr_storm_replays_rather_than_refusing(pool, conn, make_account):
+    # Identical retries wait on the reference lock, not the key, so they reach
+    # the duplicate-reference check. They must still come back as replays.
+    bank = make_account("bank", allow_negative=True)
+    a = make_account("alice")
+    results = run_together(pool, 20, lambda c, i: core.transfer(
+        c, client=CLIENT, key="hook-1", from_account=bank, to_account=a, amount=500, external_ref="UTR43"))
+    assert all(isinstance(r, core.Posted) for r in results), Counter(map(outcome, results))
+    assert len({r.transaction_id for r in results}) == 1
+    assert balance(conn, a) == 500

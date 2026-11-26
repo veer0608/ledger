@@ -1,12 +1,21 @@
--- Double-entry ledger schema. Safe to re-run.
+-- Double-entry ledger schema. Run as the OWNER role (see db.migrate). Safe to re-run.
 --
 -- Amounts are bigint minor units (paise for INR). There are no floats anywhere.
--- The database, not the application, enforces the rules that keep money correct:
+--
+-- Two roles:
+--   owner       runs this file, owns the tables. Trusted, like any DBA.
+--   ledger_app  what the service connects as. It can read, insert, and call
+--               two SECURITY DEFINER functions. It cannot UPDATE, DELETE,
+--               TRUNCATE, ALTER, disable triggers, or create an account that
+--               may go negative. Every rule below holds against this role.
+--
+-- The rules:
 --   1. every transaction's entries sum to zero, checked at COMMIT
 --   2. an account's balance is derived from its entries by a trigger and
 --      cannot be written directly
 --   3. entries and transactions are append-only; mistakes are fixed by reversal
 --   4. an entry's currency must match both its account and its transaction
+--   5. an external reference (UTR) is posted at most once, unless reversed
 
 CREATE TABLE IF NOT EXISTS accounts (
     id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -21,7 +30,10 @@ CREATE TABLE IF NOT EXISTS accounts (
 
 CREATE TABLE IF NOT EXISTS transactions (
     id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    idempotency_key text        NOT NULL UNIQUE,
+    -- Idempotency keys are scoped to the client that sent them, so two
+    -- clients that both number their requests from 1 never collide.
+    client_id       text        NOT NULL CHECK (length(client_id) BETWEEN 1 AND 100),
+    idempotency_key text        NOT NULL CHECK (length(idempotency_key) BETWEEN 1 AND 255),
     request_hash    text        NOT NULL,
     currency        char(3)     NOT NULL,
     memo            text,
@@ -30,6 +42,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     -- reversal fail even when two arrive at the same instant.
     reverses_id     bigint UNIQUE REFERENCES transactions (id),
     created_at      timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (client_id, idempotency_key),
     UNIQUE (id, currency)
 );
 
@@ -51,8 +64,11 @@ CREATE INDEX IF NOT EXISTS entries_transaction_idx ON entries (transaction_id);
 CREATE INDEX IF NOT EXISTS transactions_ref_idx    ON transactions (external_ref) WHERE external_ref IS NOT NULL;
 
 
--- Rule 2a: inserting an entry moves its account's balance.
-CREATE OR REPLACE FUNCTION ledger_apply_entry() RETURNS trigger LANGUAGE plpgsql AS $$
+-- Rule 2a: inserting an entry moves its account's balance. SECURITY DEFINER
+-- because the app role has no UPDATE on accounts; this function is the only
+-- path by which a balance changes.
+CREATE OR REPLACE FUNCTION ledger_apply_entry() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 BEGIN
     UPDATE accounts SET balance = balance + NEW.amount WHERE id = NEW.account_id;
     RETURN NULL;
@@ -64,8 +80,9 @@ CREATE TRIGGER entries_apply
     FOR EACH ROW EXECUTE FUNCTION ledger_apply_entry();
 
 
--- Rule 2b: nothing else may write accounts.balance. The update issued by
--- ledger_apply_entry runs at trigger depth 2; a direct UPDATE runs at depth 1.
+-- Rule 2b: nothing else may write accounts.balance, not even the owner short
+-- of disabling triggers. The update issued by ledger_apply_entry runs at
+-- trigger depth 2; a direct UPDATE runs at depth 1.
 CREATE OR REPLACE FUNCTION ledger_guard_balance() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     IF TG_OP = 'INSERT' AND NEW.balance <> 0 THEN
@@ -85,7 +102,8 @@ CREATE TRIGGER accounts_guard_balance
     FOR EACH ROW EXECUTE FUNCTION ledger_guard_balance();
 
 
--- Rule 3: history is append-only.
+-- Rule 3: history is append-only. The app role has no UPDATE/DELETE/TRUNCATE
+-- grant at all; these triggers also stop the owner's row-level edits.
 CREATE OR REPLACE FUNCTION ledger_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     RAISE EXCEPTION '% is append-only; post a reversal instead', TG_TABLE_NAME
@@ -145,6 +163,50 @@ CREATE CONSTRAINT TRIGGER transactions_balanced
     FOR EACH ROW EXECUTE FUNCTION ledger_check_balanced();
 
 
+-- Rule 5: one live posting per external reference. A webhook redelivered
+-- under a fresh idempotency key must not credit the same UTR twice. A plain
+-- UNIQUE index cannot express "unless that posting was reversed" (the usual
+-- fix for money sent to the wrong account), so a trigger checks it,
+-- serialised per reference by an advisory lock so two arriving together
+-- cannot both pass. Reversals carry the original's reference and are exempt.
+CREATE OR REPLACE FUNCTION ledger_one_live_ref() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    existing bigint;
+BEGIN
+    IF NEW.external_ref IS NULL OR NEW.reverses_id IS NOT NULL THEN
+        RETURN NEW;
+    END IF;
+    PERFORM pg_advisory_xact_lock(724502, hashtext(NEW.external_ref));
+    -- Read committed: this statement's snapshot is taken after the lock is
+    -- granted, so it sees a competing posting that just committed.
+    SELECT t.id INTO existing
+    FROM transactions t
+    WHERE t.external_ref = NEW.external_ref
+      AND t.reverses_id IS NULL
+      AND NOT EXISTS (SELECT 1 FROM transactions r WHERE r.reverses_id = t.id)
+    LIMIT 1;
+    IF existing IS NOT NULL THEN
+        RAISE EXCEPTION 'external_ref % is already posted as transaction %', NEW.external_ref, existing
+            USING ERRCODE = 'unique_violation', CONSTRAINT = 'transactions_external_ref_live';
+    END IF;
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS transactions_one_live_ref ON transactions;
+CREATE TRIGGER transactions_one_live_ref
+    BEFORE INSERT ON transactions
+    FOR EACH ROW EXECUTE FUNCTION ledger_one_live_ref();
+
+
+-- Row locks for a posting, taken in id order so opposite transfers queue
+-- instead of deadlocking. SECURITY DEFINER because SELECT ... FOR UPDATE
+-- needs UPDATE privilege, which the app role deliberately does not have.
+CREATE OR REPLACE FUNCTION ledger_lock_accounts(ids bigint[]) RETURNS SETOF accounts
+LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+    SELECT * FROM accounts WHERE id = ANY(ids) ORDER BY id FOR UPDATE
+$$;
+
+
 -- Audit view: any row here means a stored balance disagrees with its entries.
 -- It should always be empty; /health reports it.
 CREATE OR REPLACE VIEW ledger_drift AS
@@ -153,3 +215,28 @@ FROM accounts a
 LEFT JOIN entries e ON e.account_id = a.id
 GROUP BY a.id
 HAVING a.balance <> coalesce(sum(e.amount), 0);
+
+
+-- The app role. Created without LOGIN; db.migrate sets its password.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'ledger_app') THEN
+        CREATE ROLE ledger_app NOLOGIN;
+    END IF;
+END $$;
+
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO ledger_app;
+
+REVOKE ALL ON accounts, transactions, entries, ledger_drift FROM PUBLIC, ledger_app;
+GRANT SELECT ON accounts, transactions, entries, ledger_drift TO ledger_app;
+-- Column-level INSERT grants: the app cannot set a balance, cannot backdate
+-- created_at, and cannot create an account with allow_negative (a mint).
+-- Those are created by the owner.
+GRANT INSERT (name, currency) ON accounts TO ledger_app;
+GRANT INSERT (client_id, idempotency_key, request_hash, currency, memo, external_ref, reverses_id)
+    ON transactions TO ledger_app;
+GRANT INSERT (transaction_id, account_id, currency, amount) ON entries TO ledger_app;
+
+REVOKE ALL ON FUNCTION ledger_apply_entry(), ledger_lock_accounts(bigint[]) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION ledger_lock_accounts(bigint[]) TO ledger_app;

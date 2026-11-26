@@ -5,3 +5,4 @@ __pycache__/
 demo/
 recon_report.csv
 .env
+.ledger-app-password

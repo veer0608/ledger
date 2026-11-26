@@ -6,12 +6,16 @@ what an account holds; a transfer is a negative entry on the sender and a
 positive entry on the receiver.
 
 Concurrency, in one paragraph: a posting locks every account it touches with
-SELECT ... FOR UPDATE in ascending id order, so two transfers between the same
-pair of accounts in opposite directions queue instead of deadlocking. The
-balance check happens after the lock, so two withdrawals cannot both see the
-same old balance. The idempotency key is claimed by INSERT ... ON CONFLICT
-inside the same transaction, so a retried request either waits for the first
-attempt and replays its result, or (if the first attempt rolled back) runs.
+SELECT ... FOR UPDATE in ascending id order (via ledger_lock_accounts), so two
+transfers between the same pair of accounts in opposite directions queue
+instead of deadlocking. The balance check happens after the lock, so two
+withdrawals cannot both see the same old balance. The idempotency key is
+claimed by INSERT ... ON CONFLICT inside the same transaction, so a retried
+request either waits for the first attempt and replays its result, or (if
+the first attempt rolled back) runs.
+
+Idempotency keys are scoped per client: (client_id, key) is unique, not key
+alone. In a deployment client_id comes from the auth layer in front of this.
 """
 from __future__ import annotations
 
@@ -34,6 +38,11 @@ class LedgerError(Exception):
     code = "bad_request"
 
 
+class Forbidden(LedgerError):
+    status = 403
+    code = "forbidden"
+
+
 class NotFound(LedgerError):
     status = 404
     code = "not_found"
@@ -52,6 +61,10 @@ class AlreadyReversed(Conflict):
     code = "already_reversed"
 
 
+class DuplicateReference(Conflict):
+    code = "duplicate_external_ref"
+
+
 class InsufficientFunds(LedgerError):
     status = 422
     code = "insufficient_funds"
@@ -65,7 +78,7 @@ class CurrencyMismatch(LedgerError):
 @dataclass(frozen=True)
 class Posted:
     transaction_id: int
-    replayed: bool  # True when this key had already been used for the same request
+    replayed: bool  # True when this client had already used this key for the same request
 
 
 def _cur(conn: psycopg.Connection) -> psycopg.Cursor:
@@ -77,9 +90,14 @@ def _request_hash(payload: dict) -> str:
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
-def _check_key(key: str) -> None:
-    if not isinstance(key, str) or not key.strip() or len(key) > 255:
-        raise LedgerError("idempotency key must be 1 to 255 characters")
+def _check_text(value: object, what: str, max_len: int, required: bool) -> None:
+    if value is None and not required:
+        return
+    if not isinstance(value, str) or not value.strip() or len(value) > max_len:
+        raise LedgerError(f"{what} must be 1 to {max_len} characters")
+    # Postgres text cannot hold NUL; other control characters have no business in a key or reference.
+    if any(ord(ch) < 32 and ch not in "\t" for ch in value):
+        raise LedgerError(f"{what} contains a control character")
 
 
 def _check_amount(amount: object) -> None:
@@ -93,18 +111,24 @@ def _check_amount(amount: object) -> None:
 # ---------------------------------------------------------------- accounts
 
 def create_account(conn, name: str, currency: str, allow_negative: bool = False) -> dict:
-    if not name or not name.strip():
-        raise LedgerError("account name is required")
+    """allow_negative accounts (mints, settlement accounts) need the owner role."""
+    _check_text(name, "account name", 200, required=True)
     if not CURRENCY_RE.match(currency or ""):
         raise LedgerError("currency must be a 3-letter ISO code such as INR")
+    # The app role has no INSERT grant on allow_negative, so the column is only
+    # named when it is actually being set.
+    cols, vals = ["name", "currency"], [name, currency]
+    if allow_negative:
+        cols.append("allow_negative")
+        vals.append(True)
+    query = f"""INSERT INTO accounts ({", ".join(cols)}) VALUES ({", ".join(["%s"] * len(cols))})
+                RETURNING id, name, currency, allow_negative, balance, created_at"""
     try:
-        return _cur(conn).execute(
-            """INSERT INTO accounts (name, currency, allow_negative) VALUES (%s, %s, %s)
-               RETURNING id, name, currency, allow_negative, balance, created_at""",
-            (name, currency, allow_negative),
-        ).fetchone()
+        return _cur(conn).execute(query, vals).fetchone()
     except errors.UniqueViolation:
         raise Conflict(f"account {name!r} already exists") from None
+    except errors.InsufficientPrivilege:
+        raise Forbidden("only the database owner can create an account that may go negative") from None
 
 
 def get_account(conn, account_id: int) -> dict:
@@ -148,7 +172,7 @@ def statement(conn, account_id: int, limit: int = 100) -> dict:
 def get_transaction(conn, transaction_id: int) -> dict:
     cur = _cur(conn)
     txn = cur.execute(
-        """SELECT id, idempotency_key, currency, memo, external_ref, reverses_id, created_at
+        """SELECT id, client_id, idempotency_key, currency, memo, external_ref, reverses_id, created_at
            FROM transactions WHERE id = %s""",
         (transaction_id,),
     ).fetchone()
@@ -161,38 +185,43 @@ def get_transaction(conn, transaction_id: int) -> dict:
     return txn
 
 
-def transfer(conn, *, key: str, from_account: int, to_account: int, amount: int,
+def transfer(conn, *, client: str, key: str, from_account: int, to_account: int, amount: int,
              memo: str | None = None, external_ref: str | None = None) -> Posted:
-    _check_key(key)
+    _check_text(client, "client id", 100, required=True)
+    _check_text(key, "idempotency key", 255, required=True)
+    _check_text(memo, "memo", 500, required=False)
+    _check_text(external_ref, "external_ref", 200, required=False)
     _check_amount(amount)
     if from_account == to_account:
         raise LedgerError("cannot transfer an account to itself")
     payload = {"op": "transfer", "from": from_account, "to": to_account, "amount": amount,
                "memo": memo, "external_ref": external_ref}
-    return _post(conn, key=key, request_hash=_request_hash(payload),
+    return _post(conn, client=client, key=key, request_hash=_request_hash(payload),
                  legs=[(from_account, -amount), (to_account, amount)],
                  memo=memo, external_ref=external_ref)
 
 
-def reverse(conn, *, key: str, transaction_id: int) -> Posted:
+def reverse(conn, *, client: str, key: str, transaction_id: int) -> Posted:
     """Post the mirror image of a transaction. History is never edited."""
-    _check_key(key)
+    _check_text(client, "client id", 100, required=True)
+    _check_text(key, "idempotency key", 255, required=True)
     request_hash = _request_hash({"op": "reverse", "transaction_id": transaction_id})
-    replay = _replay(conn, key, request_hash)
+    replay = _replay(conn, client, key, request_hash)
     if replay:
         return replay
     original = get_transaction(conn, transaction_id)
     if original["reverses_id"] is not None:
         raise LedgerError("cannot reverse a reversal; post a new transfer instead")
     legs = [(e["account_id"], -e["amount"]) for e in original["entries"]]
-    return _post(conn, key=key, request_hash=request_hash, legs=legs,
+    return _post(conn, client=client, key=key, request_hash=request_hash, legs=legs,
                  memo=f"reversal of transaction {transaction_id}",
                  external_ref=original["external_ref"], reverses_id=transaction_id)
 
 
-def _replay(conn, key: str, request_hash: str) -> Posted | None:
+def _replay(conn, client: str, key: str, request_hash: str) -> Posted | None:
     row = conn.execute(
-        "SELECT id, request_hash FROM transactions WHERE idempotency_key = %s", (key,)
+        "SELECT id, request_hash FROM transactions WHERE client_id = %s AND idempotency_key = %s",
+        (client, key),
     ).fetchone()
     if row is None:
         return None
@@ -201,10 +230,10 @@ def _replay(conn, key: str, request_hash: str) -> Posted | None:
     return Posted(row[0], replayed=True)
 
 
-def _post(conn, *, key: str, request_hash: str, legs: list[tuple[int, int]],
+def _post(conn, *, client: str, key: str, request_hash: str, legs: list[tuple[int, int]],
           memo: str | None, external_ref: str | None, reverses_id: int | None = None) -> Posted:
     # Fast path for the common retry: no locks needed to replay.
-    replay = _replay(conn, key, request_hash)
+    replay = _replay(conn, client, key, request_hash)
     if replay:
         return replay
 
@@ -212,12 +241,8 @@ def _post(conn, *, key: str, request_hash: str, legs: list[tuple[int, int]],
     try:
         with conn.transaction():
             cur = _cur(conn)
-            # ORDER BY id + FOR UPDATE takes the row locks in id order.
             accounts = {r["id"]: r for r in cur.execute(
-                """SELECT id, currency, balance, allow_negative FROM accounts
-                   WHERE id = ANY(%s) ORDER BY id FOR UPDATE""",
-                (ids,),
-            )}
+                "SELECT id, currency, balance, allow_negative FROM ledger_lock_accounts(%s)", (ids,))}
             missing = sorted(set(ids) - accounts.keys())
             if missing:
                 raise NotFound(f"account {missing[0]} not found")
@@ -230,15 +255,15 @@ def _post(conn, *, key: str, request_hash: str, legs: list[tuple[int, int]],
             # already succeeded must replay, not fail for lack of the money it moved.
             claimed = cur.execute(
                 """INSERT INTO transactions
-                       (idempotency_key, request_hash, currency, memo, external_ref, reverses_id)
-                   VALUES (%s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (idempotency_key) DO NOTHING
+                       (client_id, idempotency_key, request_hash, currency, memo, external_ref, reverses_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (client_id, idempotency_key) DO NOTHING
                    RETURNING id""",
-                (key, request_hash, currency, memo, external_ref, reverses_id),
+                (client, key, request_hash, currency, memo, external_ref, reverses_id),
             ).fetchone()
             if claimed is None:
                 # A concurrent request with this key committed while we waited.
-                replay = _replay(conn, key, request_hash)
+                replay = _replay(conn, client, key, request_hash)
                 if replay is None:  # pragma: no cover - would mean the key vanished
                     raise RuntimeError(f"idempotency key {key!r} conflicted but no row is visible")
                 return replay
@@ -258,14 +283,24 @@ def _post(conn, *, key: str, request_hash: str, legs: list[tuple[int, int]],
                 [(txn_id, acct, currency, amount) for acct, amount in legs],
             )
     except errors.UniqueViolation as exc:
-        if exc.diag.constraint_name == "transactions_reverses_id_key":
+        name = exc.diag.constraint_name
+        if name == "transactions_reverses_id_key":
             raise AlreadyReversed(f"transaction {reverses_id} has already been reversed") from None
+        if name == "transactions_external_ref_live":
+            # The same request retried at the same instant also lands here: it
+            # waited on the reference lock, not the key. Replay it if so.
+            replay = _replay(conn, client, key, request_hash)
+            if replay:
+                return replay
+            raise DuplicateReference(exc.diag.message_primary) from None
         raise
     except errors.CheckViolation as exc:
         # Backstop: the explicit check above should always fire first.
         if exc.diag.constraint_name == "balance_floor":
             raise InsufficientFunds("balance would go below zero") from None
         raise
+    except errors.NumericValueOutOfRange:
+        raise LedgerError("balance would exceed the largest representable amount") from None
     return Posted(txn_id, replayed=False)
 
 

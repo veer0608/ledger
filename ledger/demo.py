@@ -13,25 +13,34 @@ import os
 from datetime import timedelta
 from pathlib import Path
 
+import psycopg
+
 from . import core, db, recon
 
 OUT = db.ROOT / "demo"
 
 
 def main() -> int:
-    url = os.environ.get("DEMO_DATABASE_URL") or db.local_url("ledger_demo")
-    pool = db.make_pool(url, max_size=2)
-    with pool.connection() as conn:
-        db.apply_schema(conn)
-        conn.execute("TRUNCATE entries, transactions, accounts RESTART IDENTITY CASCADE")
+    owner_url = os.environ.get("DEMO_DATABASE_URL") or db.local_url("ledger_demo")
+    db.migrate(owner_url)
+    # Setup is the owner's job: wiping the demo, and creating the one account
+    # that may go negative. Everything after runs as the app role.
+    with psycopg.connect(owner_url, autocommit=True) as owner:
+        owner.execute("TRUNCATE entries, transactions, accounts RESTART IDENTITY CASCADE")
+        bank = core.create_account(owner, "bank:hdfc", "INR", allow_negative=True)["id"]
 
-        bank = core.create_account(conn, "bank:hdfc", "INR", allow_negative=True)["id"]
+    pool = db.make_pool(db.as_app_role(owner_url), max_size=2)
+    with pool.connection() as conn:
+        try:
+            core.create_account(conn, "mint:sneaky", "INR", allow_negative=True)
+        except core.Forbidden as exc:
+            print(f"app role refused a mint: {exc}")
         asha = core.create_account(conn, "wallet:asha", "INR")["id"]
         ravi = core.create_account(conn, "wallet:ravi", "INR")["id"]
         fees = core.create_account(conn, "revenue:fees", "INR")["id"]
 
         def t(key, src, dst, rupees, memo, ref=None):
-            return core.transfer(conn, key=key, from_account=src, to_account=dst,
+            return core.transfer(conn, client="wallet-app", key=key, from_account=src, to_account=dst,
                                  amount=recon.to_minor(rupees), memo=memo, external_ref=ref)
 
         t("dep-1", bank, asha, "5000", "UPI deposit", "UTR001")
@@ -45,8 +54,13 @@ def main() -> int:
 
         # A retry of a deposit the client thought had failed: replays, pays nothing.
         assert t("dep-1", bank, asha, "5000", "UPI deposit", "UTR001").replayed
+        # The bank's webhook for UTR001 redelivered with a fresh key: refused, not credited twice.
+        try:
+            t("webhook-redelivery-77", bank, asha, "5000", "UPI deposit", "UTR001")
+        except core.DuplicateReference as exc:
+            print(f"redelivered webhook refused: {exc}")
         # Waive the fee: a reversal, not an edit.
-        core.reverse(conn, key="waive-fee-1", transaction_id=fee.transaction_id)
+        core.reverse(conn, client="wallet-app", key="waive-fee-1", transaction_id=fee.transaction_id)
 
         print("balances")
         for acct in (bank, asha, ravi, fees):
@@ -74,7 +88,7 @@ def main() -> int:
             for d, amount, ref, desc in statement:
                 w.writerow([d.isoformat(), amount, ref, desc])
 
-        results = recon.run(conn, stmt_path, "bank:hdfc")
+        results = recon.run(conn, stmt_path, "bank:hdfc", today - timedelta(days=1), today)
     pool.close()
 
     report = OUT / "recon_report.csv"

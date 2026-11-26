@@ -1,6 +1,6 @@
 """Reconcile a bank statement CSV against the ledger's settlement account.
 
-    python -m ledger.recon statement.csv --account bank:hdfc
+    python -m ledger.recon statement.csv --account bank:hdfc --from 2026-11-01 --to 2026-11-30
 
 The settlement account stands for the outside world as seen through one bank
 account. Money that arrives through the bank enters the ledger as a transfer
@@ -20,6 +20,12 @@ Matching runs in two passes:
      payments with different UTRs are never glued together on amount alone.
 Whatever is left is bank_only (money moved, ledger never heard) or
 ledger_only (ledger recorded it, bank has not).
+
+The statement period is given, never inferred from the statement's own
+lines. Inferring it from the first and last bank line silently dropped any
+ledger entry dated before the bank's first line, which is exactly the entry
+that never reached the bank. Every ledger entry dated inside the period is
+reported. A statement line outside the period is an error: wrong file.
 
 Exit code is 0 only when everything matched cleanly.
 """
@@ -198,19 +204,24 @@ def local_today() -> date:
     return datetime.now(LOCAL_TZ).date()
 
 
-def run(conn, statement: Path, account_name: str, window_days: int = 2) -> list[Result]:
+def run(conn, statement: Path, account_name: str, start: date, end: date,
+        window_days: int = 2) -> list[Result]:
+    if end < start:
+        raise ValueError(f"period ends ({end}) before it starts ({start})")
+    if not conn.execute("SELECT 1 FROM accounts WHERE name = %s", (account_name,)).fetchone():
+        raise ValueError(f"no ledger account named {account_name!r}")
     bank = read_statement(statement)
-    if not bank:
-        raise ValueError(f"{statement}: no rows")
-    first = min(b.date for b in bank)
-    last = max(b.date for b in bank)
+    outside = [b for b in bank if not start <= b.date <= end]
+    if outside:
+        b = outside[0]
+        raise ValueError(f"{statement}:{b.line}: dated {b.date}, outside the period {start} to {end}")
     window = timedelta(days=window_days)
-    ledger = load_ledger(conn, account_name, first - window, last + window)
+    ledger = load_ledger(conn, account_name, start - window, end + window)
     results = reconcile(bank, ledger, window_days)
-    # Ledger lines just outside the statement period were loaded only as match
+    # Ledger lines in the margin outside the period were loaded only as match
     # candidates; unmatched, they belong to the neighbouring statement.
     return [r for r in results
-            if not (r.status == "ledger_only" and not first <= r.ledger.date <= last)]
+            if not (r.status == "ledger_only" and not start <= r.ledger.date <= end)]
 
 
 def write_report(results: list[Result], path: Path) -> None:
@@ -250,14 +261,18 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("statement", type=Path)
     ap.add_argument("--account", required=True, help="ledger settlement account name, e.g. bank:hdfc")
+    ap.add_argument("--from", dest="start", required=True, type=date.fromisoformat,
+                    help="first day of the statement period, YYYY-MM-DD")
+    ap.add_argument("--to", dest="end", required=True, type=date.fromisoformat,
+                    help="last day of the statement period, YYYY-MM-DD")
     ap.add_argument("--window", type=int, default=2, help="days either side for amount matching (default 2)")
     ap.add_argument("--out", type=Path, default=Path("recon_report.csv"))
     args = ap.parse_args(argv)
 
-    pool = db.make_pool(db.database_url(), max_size=2)
+    pool = db.make_pool(db.app_url(), max_size=2)
     try:
         with pool.connection() as conn:
-            results = run(conn, args.statement, args.account, args.window)
+            results = run(conn, args.statement, args.account, args.start, args.end, args.window)
     finally:
         pool.close()
     write_report(results, args.out)
