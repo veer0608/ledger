@@ -122,6 +122,26 @@ CREATE INDEX IF NOT EXISTS entries_account_idx     ON entries (account_id, id);
 CREATE INDEX IF NOT EXISTS entries_transaction_idx ON entries (transaction_id);
 CREATE INDEX IF NOT EXISTS transactions_ref_idx    ON transactions (external_ref) WHERE external_ref IS NOT NULL;
 
+-- An entry is written in the same database transaction as its transaction
+-- row, never later. Without this, the app role could append a balanced pair
+-- (-700 here, +700 there) to an old transaction: the sum stays zero, so the
+-- balance check passes, and money moves with no new posting, no idempotency
+-- key and no event. now() is fixed for a whole database transaction and the
+-- app cannot set created_at, so matching created_at proves it is the same one.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'transactions_id_currency_created_key') THEN
+        ALTER TABLE transactions
+            ADD CONSTRAINT transactions_id_currency_created_key UNIQUE (id, currency, created_at);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'entries_written_with_their_transaction') THEN
+        ALTER TABLE entries
+            ADD CONSTRAINT entries_written_with_their_transaction
+            FOREIGN KEY (transaction_id, currency, created_at)
+            REFERENCES transactions (id, currency, created_at);
+    END IF;
+END $$;
+
 
 -- Rule 2a: inserting an entry moves its account's balance. SECURITY DEFINER
 -- because the app role has no UPDATE on accounts; this function is the only

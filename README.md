@@ -27,6 +27,7 @@ can disable any trigger.
 | A transaction is reversed at most once | `UNIQUE (reverses_id)` | `test_double_reversal_race` |
 | History cannot be edited or wiped | no `UPDATE`/`DELETE`/`TRUNCATE` grant; row triggers also stop the owner's edits | `test_app_role_is_refused[truncate history]` |
 | The app cannot make a mint | column-level `INSERT` grant excludes `allow_negative` | `test_app_role_is_refused[open a mint]` |
+| Entries are written with their transaction, never added to it later | composite foreign key on `(transaction_id, currency, created_at)` | `test_cannot_append_entries_to_an_old_transaction` |
 | No currency mixing | composite foreign keys tie each entry's currency to its account and transaction | `test_entry_currency_must_match_account` |
 | Money on hold cannot be spent | the balance floor is `balance - held >= 0`; `held` is derived from pending holds by trigger | `test_holds::test_holds_and_transfers_race_for_the_same_money` |
 | A hold resolves exactly once | guard trigger allows only pending to captured, voided or expired | `test_capture_versus_void_race` |
@@ -53,6 +54,7 @@ found by attacking it, then fixed, then the attack was rerun:
 | Idempotency keys were global | two shops both sending `checkout-1`: the second shop's identical payment got a "success" replay and never ran | keys are scoped per `Client-Id` |
 | A NUL byte in `memo` was a 500 | `"memo": "a\u0000b"` | control characters rejected with a 400 |
 | Balance overflow was a 500 | about 9,300 maximum-size deposits into one account | mapped to a 400 |
+| Money could move inside an old transaction (found later, while designing period close) | as the app role, append a -700 and a +700 entry to a transaction committed earlier: the sum stays zero, so the balance check passed, and 700 moved with no new posting, no idempotency key and no event, while the audit still said ok | an entry must carry its transaction's `created_at` through a composite foreign key; `now()` is fixed for a database transaction and the app cannot set `created_at`, so only the transaction that wrote the row can add entries to it. On a database where it already happened, the upgrade fails and names the entry |
 
 ## The race tests can fail
 
@@ -75,6 +77,7 @@ protection is removed. Each one was checked by breaking the code on purpose:
 | `capture` skips its own expiry check | still refused: the database guard raises instead, with a less friendly error |
 | `authorize` skips its funds check | **all tests still pass**: the balance floor refuses the hold |
 | `sweep` reads the buffer's balance before taking its lock | 19 of 20 concurrent sweeps of one buffer crash; the buffer's floor stops the money moving twice (three runs) |
+| Drop the `created_at` foreign key on entries | a balanced pair appended to an old transaction moves 700 |
 | Remove the database's sweep-only rule for buffers | two raw-SQL tests pay a stranger out of a buffer |
 | Remove the application's check that a buffer cannot pay | **all money tests still pass**: the database refuses; only the API's error code changes, to `insufficient_funds` |
 | The relay claims events without `FOR UPDATE SKIP LOCKED` | 8 relays send 151 events 211 times; fails 5 runs of 5 |
@@ -475,5 +478,5 @@ ledger/jobs.py      scheduled jobs (hold expiry, buffer sweep)
 ledger/relay.py     delivers outbox events as signed webhooks
 ledger/bench.py     throughput: one hot account vs shards or buffers vs none
 ledger/demo.py      end-to-end run
-tests/              203 tests: core, holds, shard groups, receive buffers, events and the relay, raw-SQL attacks as the app role, races, API, reconciliation
+tests/              204 tests: core, holds, shard groups, receive buffers, events and the relay, raw-SQL attacks as the app role, races, API, reconciliation
 ```

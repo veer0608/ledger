@@ -147,3 +147,16 @@ def test_owner_cannot_open_an_account_with_a_balance(owner_conn):
 def test_schema_is_rerunnable(owner_url):
     db.migrate(owner_url)
     db.migrate(owner_url)
+
+
+def test_cannot_append_entries_to_an_old_transaction(conn, make_account):
+    # Found by probing: a balanced pair added to a committed transaction kept
+    # its sum at zero, so the balance check passed and 700 moved with no new
+    # posting, no idempotency key and no event.
+    alice, mallory = make_account("alice", 1_000), make_account("mallory")
+    [old] = [r[0] for r in conn.execute("SELECT id FROM transactions ORDER BY id DESC LIMIT 1")]
+    with pytest.raises(errors.ForeignKeyViolation, match="entries_written_with_their_transaction"):
+        with conn.transaction():
+            conn.execute("INSERT INTO entries (transaction_id, account_id, currency, amount) "
+                         "VALUES (%s, %s, 'INR', -700), (%s, %s, 'INR', 700)", (old, alice, old, mallory))
+    assert (balance(conn, alice), balance(conn, mallory)) == (1_000, 0)
