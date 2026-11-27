@@ -6,7 +6,7 @@ what an account holds; a transfer is a negative entry on the sender and a
 positive entry on the receiver.
 
 Concurrency, in one paragraph: a posting locks every account it touches with
-SELECT ... FOR UPDATE in ascending id order (via ledger_lock_accounts), so two
+SELECT ... FOR NO KEY UPDATE in ascending id order (via ledger_lock_accounts), so two
 transfers between the same pair of accounts in opposite directions queue
 instead of deadlocking. The balance check happens after the lock, so two
 withdrawals cannot both see the same old balance. The idempotency key is
@@ -78,6 +78,11 @@ class InsufficientFunds(LedgerError):
 class CurrencyMismatch(LedgerError):
     status = 422
     code = "currency_mismatch"
+
+
+class PeriodClosed(Conflict):
+    """The books closed while this request was in flight. Retrying with the same key is safe."""
+    code = "period_closed"
 
 
 class ReceiveOnly(LedgerError):
@@ -281,22 +286,87 @@ def account_id(conn, name: str) -> int:
 
 
 def statement(conn, account_id: int, limit: int = 100) -> dict:
-    """Latest entries on an account, newest first, each with the balance after it."""
-    account = get_account(conn, account_id)
-    rows = _cur(conn).execute(
-        """SELECT * FROM (
-               SELECT e.id AS entry_id, e.transaction_id, e.amount, t.memo, t.external_ref,
-                      e.created_at,
-                      sum(e.amount) OVER (ORDER BY e.id) AS balance_after
-               FROM entries e
+    """Latest entries on an account, newest first, each with the balance after it.
+
+    Works back from the current balance, so it reads `limit` entries however
+    long the history is. Balance and entries are read in one REPEATABLE READ
+    snapshot, so a posting that commits in between cannot skew the arithmetic.
+    """
+    with conn.transaction():
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        account = get_account(conn, account_id)
+        rows = _cur(conn).execute(
+            """SELECT e.id AS entry_id, e.transaction_id, e.amount, t.memo, t.external_ref, e.created_at,
+                      %(balance)s - coalesce(sum(e.amount) OVER (ORDER BY e.id DESC
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS balance_after
+               FROM (SELECT * FROM entries WHERE account_id = %(id)s ORDER BY id DESC LIMIT %(limit)s) e
                JOIN transactions t ON t.id = e.transaction_id
-               WHERE e.account_id = %s
-           ) s
-           ORDER BY entry_id DESC
-           LIMIT %s""",
-        (account_id, limit),
-    ).fetchall()
+               ORDER BY e.id DESC""",
+            {"balance": account["balance"], "id": account_id, "limit": limit},
+        ).fetchall()
     return {"account": account, "entries": rows}
+
+
+# ------------------------------------------------------------------ periods
+
+def close_period(conn, through) -> int:
+    """Close the books through `through` (a past, timezone-aware datetime).
+
+    Waits for postings in flight, snapshots every account that moved since
+    the last close, and returns how many snapshots it wrote. Must run in its
+    own READ COMMITTED transaction, which an autocommit connection gives it.
+    """
+    if getattr(through, "tzinfo", None) is None:
+        raise LedgerError("through must be a timezone-aware datetime")
+    try:
+        return conn.execute("SELECT ledger_close_period(%s)", (through,)).fetchone()[0]
+    except errors.CheckViolation as exc:
+        raise Conflict(exc.diag.message_primary) from None
+
+
+def closed_through(conn):
+    return conn.execute("SELECT max(through) FROM ledger_closes").fetchone()[0]
+
+
+_AS_OF = """
+    SELECT a.id, a.name, a.currency,
+           coalesce(s.balance, 0) + coalesce(
+               (SELECT sum(e.amount) FROM entries e
+                WHERE e.account_id = a.id
+                  AND e.created_at > coalesce(s.as_of, '-infinity') AND e.created_at <= %(at)s), 0) AS balance
+    FROM accounts a
+    LEFT JOIN LATERAL (SELECT b.as_of, b.balance FROM balance_snapshots b
+                       WHERE b.account_id = a.id AND b.as_of <= %(at)s
+                       ORDER BY b.as_of DESC LIMIT 1) s ON true
+"""
+
+
+def balance_at(conn, account_id: int, at) -> dict:
+    """An account's balance at a moment: its latest snapshot then, plus the entries after.
+
+    `final` is True when the books are closed through `at`. Otherwise a
+    posting still in flight could yet commit with an earlier timestamp.
+    """
+    with conn.transaction():
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        row = _cur(conn).execute(_AS_OF + " WHERE a.id = %(id)s", {"at": at, "id": account_id}).fetchone()
+        if row is None:
+            raise NotFound(f"account {account_id} not found")
+        closed = closed_through(conn)
+    return {**row, "at": at, "final": closed is not None and at <= closed}
+
+
+def trial_balance(conn, at) -> dict:
+    """Every account's balance at a moment, and the total per currency, which must be zero."""
+    with conn.transaction():
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        rows = _cur(conn).execute(f"SELECT * FROM ({_AS_OF}) x WHERE balance <> 0 ORDER BY id", {"at": at}).fetchall()
+        closed = closed_through(conn)
+    totals: dict[str, int] = defaultdict(int)
+    for r in rows:
+        totals[r["currency"]] += r["balance"]
+    return {"at": at, "final": closed is not None and at <= closed, "accounts": rows,
+            "totals": dict(sorted(totals.items())), "balanced": all(v == 0 for v in totals.values())}
 
 
 # ------------------------------------------------------------ transactions
@@ -366,14 +436,19 @@ def _claim_transaction(cur, client: str, key: str, request_hash: str, currency: 
                        memo: str | None = None, external_ref: str | None = None,
                        reverses_id: int | None = None) -> int | None:
     """Insert the transaction row, claiming the key. None if the key is already taken."""
-    row = cur.execute(
-        """INSERT INTO transactions
-               (client_id, idempotency_key, request_hash, currency, memo, external_ref, reverses_id)
-           VALUES (%s, %s, %s, %s, %s, %s, %s)
-           ON CONFLICT (client_id, idempotency_key) DO NOTHING
-           RETURNING id""",
-        (client, key, request_hash, currency, memo, external_ref, reverses_id),
-    ).fetchone()
+    try:
+        row = cur.execute(
+            """INSERT INTO transactions
+                   (client_id, idempotency_key, request_hash, currency, memo, external_ref, reverses_id)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (client_id, idempotency_key) DO NOTHING
+               RETURNING id""",
+            (client, key, request_hash, currency, memo, external_ref, reverses_id),
+        ).fetchone()
+    except errors.CheckViolation as exc:
+        if exc.diag.constraint_name == "period_closed":
+            raise PeriodClosed(exc.diag.message_primary) from None
+        raise
     return None if row is None else row["id"]
 
 
@@ -677,8 +752,10 @@ def check_invariants(conn) -> dict:
     nonzero = [c for c in currency_totals if c["total"] != 0]
     held_drift = cur.execute("SELECT * FROM ledger_held_drift ORDER BY id").fetchall()
     missing_events = cur.execute("SELECT * FROM ledger_missing_events ORDER BY subject, id").fetchall()
+    snapshot_drift = cur.execute("SELECT * FROM ledger_snapshot_drift ORDER BY account_id, as_of").fetchall()
     return {
-        "ok": not drift and not unbalanced and not nonzero and not held_drift and not missing_events,
+        "ok": not (drift or unbalanced or nonzero or held_drift or missing_events or snapshot_drift),
+        "snapshot_drift": snapshot_drift,
         "missing_events": missing_events,
         "balance_drift": drift,
         "held_drift": held_drift,

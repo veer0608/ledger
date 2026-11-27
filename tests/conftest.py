@@ -39,7 +39,7 @@ def pool(owner_url):
 @pytest.fixture(autouse=True)
 def clean(owner_pool):
     with owner_pool.connection() as conn:
-        conn.execute("TRUNCATE outbox, entries, transactions, accounts RESTART IDENTITY CASCADE")
+        conn.execute("TRUNCATE ledger_closes, outbox, entries, transactions, accounts RESTART IDENTITY CASCADE")
     yield
 
 

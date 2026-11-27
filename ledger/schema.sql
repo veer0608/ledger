@@ -447,11 +447,18 @@ HAVING a.held <> coalesce(sum(h.amount) FILTER (WHERE h.status = 'pending'), 0);
 
 
 -- Row locks for a posting, taken in id order so opposite transfers queue
--- instead of deadlocking. SECURITY DEFINER because SELECT ... FOR UPDATE
--- needs UPDATE privilege, which the app role deliberately does not have.
+-- instead of deadlocking. SECURITY DEFINER because a row lock needs UPDATE
+-- privilege, which the app role deliberately does not have.
+--
+-- NO KEY UPDATE, not FOR UPDATE: postings never change an account's key, and
+-- FOR UPDATE also blocks the KEY SHARE lock every foreign-key check takes on
+-- the row it references. With FOR UPDATE, a close writing a snapshot (whose
+-- foreign key points at the account) waited on a posting's row lock while the
+-- posting waited on the close's period lock: a deadlock the close race test
+-- found. NO KEY UPDATE still makes postings to one account queue.
 CREATE OR REPLACE FUNCTION ledger_lock_accounts(ids bigint[]) RETURNS SETOF accounts
 LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
-    SELECT * FROM accounts WHERE id = ANY(ids) ORDER BY id FOR UPDATE
+    SELECT * FROM accounts WHERE id = ANY(ids) ORDER BY id FOR NO KEY UPDATE
 $$;
 
 
@@ -605,6 +612,114 @@ WHERE NOT EXISTS (SELECT 1 FROM outbox o WHERE o.subject_id = h.id AND o.event_t
        AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.subject_id = h.id AND o.event_type = 'hold.' || h.status));
 
 
+-- ---------------------------------------------------------- closing periods
+-- Closing the books through a moment T records every account's balance as of
+-- T (a snapshot) and makes it final. A balance at any past date is then the
+-- latest snapshot before it plus the entries after it, not a scan of history.
+--
+-- The trap is that time order and commit order differ. A posting stamps its
+-- entries with the time its database transaction STARTED. One that started
+-- before T can still be in flight when the close runs, invisible to it, and
+-- commit a moment later with a timestamp inside the closed period: the
+-- snapshot would silently miss it. So every posting holds a shared lock from
+-- its first insert to its commit, and a close takes that lock exclusively:
+-- it waits for every posting in flight, and holds new ones back until it has
+-- committed. A posting that started before T but reached its first insert
+-- after the close is refused, and its client retries with the same key.
+CREATE TABLE IF NOT EXISTS ledger_closes (
+    through   timestamptz PRIMARY KEY,
+    closed_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS balance_snapshots (
+    account_id bigint      NOT NULL REFERENCES accounts (id),
+    as_of      timestamptz NOT NULL REFERENCES ledger_closes (through),
+    balance    bigint      NOT NULL,
+    -- Written only for accounts that moved since the previous close; an
+    -- account with no row at a close kept its earlier balance.
+    PRIMARY KEY (account_id, as_of)
+);
+
+CREATE INDEX IF NOT EXISTS entries_account_time_idx ON entries (account_id, created_at);
+
+DROP TRIGGER IF EXISTS ledger_closes_append_only ON ledger_closes;
+CREATE TRIGGER ledger_closes_append_only
+    BEFORE UPDATE OR DELETE ON ledger_closes
+    FOR EACH ROW EXECUTE FUNCTION ledger_append_only();
+
+DROP TRIGGER IF EXISTS balance_snapshots_append_only ON balance_snapshots;
+CREATE TRIGGER balance_snapshots_append_only
+    BEFORE UPDATE OR DELETE ON balance_snapshots
+    FOR EACH ROW EXECUTE FUNCTION ledger_append_only();
+
+
+CREATE OR REPLACE FUNCTION ledger_period_open() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    closed timestamptz;
+BEGIN
+    -- Held until COMMIT: a close cannot start while this posting is in flight.
+    PERFORM pg_advisory_xact_lock_shared(724503, 0);
+    -- Read after the lock, so a close that just committed is seen.
+    SELECT max(through) INTO closed FROM ledger_closes;
+    IF closed IS NOT NULL AND NEW.created_at <= closed THEN
+        RAISE EXCEPTION 'the books are closed through %, and this request started at %; retry it',
+            closed, NEW.created_at
+            USING ERRCODE = 'check_violation', CONSTRAINT = 'period_closed';
+    END IF;
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS transactions_period_open ON transactions;
+CREATE TRIGGER transactions_period_open
+    BEFORE INSERT ON transactions
+    FOR EACH ROW EXECUTE FUNCTION ledger_period_open();
+
+
+CREATE OR REPLACE FUNCTION ledger_close_period(p_through timestamptz) RETURNS integer
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE
+    prev    timestamptz;
+    written integer;
+BEGIN
+    -- Each statement below must see what committed while it waited for the
+    -- lock; under REPEATABLE READ it would read an older snapshot instead.
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'close a period under READ COMMITTED, not %', current_setting('transaction_isolation')
+            USING ERRCODE = 'invalid_transaction_state';
+    END IF;
+    IF p_through >= now() THEN
+        RAISE EXCEPTION 'cannot close through %: it is not over yet', p_through USING ERRCODE = 'check_violation';
+    END IF;
+    PERFORM pg_advisory_xact_lock(724503, 0);
+    SELECT max(through) INTO prev FROM ledger_closes;
+    IF prev IS NOT NULL AND p_through <= prev THEN
+        RAISE EXCEPTION 'the books are already closed through %', prev
+            USING ERRCODE = 'check_violation', CONSTRAINT = 'period_already_closed';
+    END IF;
+    INSERT INTO ledger_closes (through) VALUES (p_through);
+    INSERT INTO balance_snapshots (account_id, as_of, balance)
+    SELECT w.account_id, p_through, coalesce(s.balance, 0) + w.moved
+    FROM (SELECT account_id, sum(amount) AS moved
+          FROM entries
+          WHERE created_at > coalesce(prev, '-infinity') AND created_at <= p_through
+          GROUP BY account_id) w
+    LEFT JOIN LATERAL (SELECT b.balance FROM balance_snapshots b
+                       WHERE b.account_id = w.account_id ORDER BY b.as_of DESC LIMIT 1) s ON true;
+    GET DIAGNOSTICS written = ROW_COUNT;
+    RETURN written;
+END $$;
+
+
+-- Audit view: a snapshot that disagrees with its entries. Always empty.
+CREATE OR REPLACE VIEW ledger_snapshot_drift AS
+SELECT s.account_id, s.as_of, s.balance,
+       (SELECT coalesce(sum(e.amount), 0) FROM entries e
+        WHERE e.account_id = s.account_id AND e.created_at <= s.as_of) AS entries_sum
+FROM balance_snapshots s
+WHERE s.balance <> (SELECT coalesce(sum(e.amount), 0) FROM entries e
+                    WHERE e.account_id = s.account_id AND e.created_at <= s.as_of);
+
+
 -- The app role. Created without LOGIN; db.migrate sets its password.
 DO $$
 BEGIN
@@ -641,6 +756,12 @@ REVOKE ALL ON outbox, ledger_missing_events FROM PUBLIC, ledger_app;
 GRANT SELECT ON outbox, ledger_missing_events TO ledger_app;
 GRANT UPDATE (attempts, next_attempt_at, delivered_at, dead_at, last_error) ON outbox TO ledger_app;
 
+-- Periods: the app reads snapshots and may close a past period through the
+-- function, which is the only writer. It cannot write a snapshot itself.
+REVOKE ALL ON ledger_closes, balance_snapshots, ledger_snapshot_drift FROM PUBLIC, ledger_app;
+GRANT SELECT ON ledger_closes, balance_snapshots, ledger_snapshot_drift TO ledger_app;
+
 REVOKE ALL ON FUNCTION ledger_apply_entry(), ledger_hold_apply(), ledger_lock_accounts(bigint[]),
-    ledger_emit_transaction(), ledger_emit_hold() FROM PUBLIC;
+    ledger_emit_transaction(), ledger_emit_hold(), ledger_close_period(timestamptz) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION ledger_close_period(timestamptz) TO ledger_app;
 GRANT EXECUTE ON FUNCTION ledger_lock_accounts(bigint[]) TO ledger_app;

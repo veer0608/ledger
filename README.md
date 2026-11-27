@@ -5,7 +5,9 @@ whether money moved. Transfers are idempotent, balances stay correct under
 concurrent load (including on the one account every payment touches),
 history is append-only, a bank reference is credited at most once, money can be held and captured later the way a card authorisation works,
 every change is published as a signed webhook event that cannot be lost or
-invented, and a reconciliation job checks the ledger against a bank statement.
+invented, the books close daily into snapshots that answer "what was the
+balance then", and a reconciliation job checks the ledger against a bank
+statement.
 
 The rules that keep money correct live in the database, not only in Python.
 They are claimed against **the role the service connects as** (`ledger_app`):
@@ -19,7 +21,7 @@ can disable any trigger.
 |---|---|---|
 | Every transaction sums to zero | deferred constraint trigger, checked at COMMIT | `test_db_guards::test_unbalanced_transaction_fails_at_commit` |
 | A balance never drifts from its entries | balance is written only by a `SECURITY DEFINER` trigger on `entries`; the app role has no `UPDATE` on accounts | `test_app_role_is_refused[write a balance]` |
-| No overdraft under a race | row locks (`SELECT ... FOR UPDATE`) plus a `CHECK (balance >= 0)` backstop | `test_concurrency::test_overdraft_race_cannot_go_negative` |
+| No overdraft under a race | row locks (`SELECT ... FOR NO KEY UPDATE`) plus a `CHECK (balance >= 0)` backstop | `test_concurrency::test_overdraft_race_cannot_go_negative` |
 | A retried request never pays twice | idempotency key claimed with `INSERT ... ON CONFLICT` in the same transaction | `test_same_key_storm_moves_money_once` |
 | Keys never collide between clients | `UNIQUE (client_id, idempotency_key)` | `test_identical_requests_from_two_clients_both_run` |
 | A bank reference (UTR) is credited at most once | trigger + advisory lock per reference; allowed again only after the first posting is reversed | `test_same_utr_race_across_unrelated_accounts` |
@@ -34,6 +36,8 @@ can disable any trigger.
 | A capture pays exactly what it says to the hold's payee | deferred trigger checks the capture transaction's entries at COMMIT | `test_capture_without_paying_the_payee_is_refused` |
 | An expired hold cannot be captured | the guard trigger compares `expires_at` to the database clock | `test_expired_hold_cannot_be_captured_and_is_released_by_the_job` |
 | A busy merchant's receive buffer pays only that merchant | deferred trigger at COMMIT: a debit from a buffer must be exactly a sweep into its merchant; only the owner creates buffers | `test_buffers::test_the_database_refuses_a_buffer_debit_the_app_did_not_check` |
+| A closed period's snapshot includes every posting stamped inside it | postings hold a shared lock to COMMIT; a close takes it exclusively and waits; a posting that started before the close and arrives after is refused | `test_periods::test_a_close_waits_for_a_posting_already_in_flight` |
+| Snapshots and closes cannot be forged, edited or undone | written only by a `SECURITY DEFINER` function; append-only triggers, even for the owner | `test_app_role_cannot_forge_or_undo_a_close` |
 | Every committed posting and hold change has exactly one event, and a rolled-back one has none | a trigger writes the event in the same database transaction; `UNIQUE (event_type, subject_id)` | `test_outbox::test_a_rolled_back_transfer_writes_no_event` |
 | The app cannot forge, rewrite or delete an event | no `INSERT` grant on the outbox; a guard trigger freezes content, even for the owner | `test_app_role_cannot_tamper_with_events` |
 | Relays running together do not send an event twice at once | claim with `FOR UPDATE SKIP LOCKED`, then a lease | `test_relays_running_together_deliver_each_event_once` |
@@ -64,7 +68,7 @@ protection is removed. Each one was checked by breaking the code on purpose:
 | Change | Result |
 |---|---|
 | Lock accounts in sender-then-receiver order instead of id order | 49 of 50 opposing transfers die with `DeadlockDetected` |
-| Remove `FOR UPDATE` | the opposing-transfer and stress tests fail with `DeadlockDetected` (the balance trigger's row updates now take locks in leg order) |
+| Remove the row lock | the opposing-transfer and stress tests fail with `DeadlockDetected` (the balance trigger's row updates now take locks in leg order) |
 | Remove `ON CONFLICT` from the key claim | 20 of 30 identical retries crash with `UniqueViolation` |
 | Remove the advisory lock from the reference rule | 13 to 16 of 20 racers credit the same UTR (three runs) |
 | Remove the replay check on a duplicate reference | 19 of 20 identical retries are refused instead of replayed |
@@ -77,6 +81,9 @@ protection is removed. Each one was checked by breaking the code on purpose:
 | `capture` skips its own expiry check | still refused: the database guard raises instead, with a less friendly error |
 | `authorize` skips its funds check | **all tests still pass**: the balance floor refuses the hold |
 | `sweep` reads the buffer's balance before taking its lock | 19 of 20 concurrent sweeps of one buffer crash; the buffer's floor stops the money moving twice (three runs) |
+| Postings skip the shared period lock | a close does not wait for a posting in flight; the race test's audit finds a snapshot that missed money (3 runs of 3) |
+| Remove the refusal of a posting that started before the close | it lands inside the closed period and the snapshot no longer matches its entries |
+| Lock accounts `FOR UPDATE` instead of `FOR NO KEY UPDATE` | postings racing a close deadlock, 5 runs of 5: see below |
 | Drop the `created_at` foreign key on entries | a balanced pair appended to an old transaction moves 700 |
 | Remove the database's sweep-only rule for buffers | two raw-SQL tests pay a stranger out of a buffer |
 | Remove the application's check that a buffer cannot pay | **all money tests still pass**: the database refuses; only the API's error code changes, to `insufficient_funds` |
@@ -308,6 +315,65 @@ inside the run-to-run noise. The first run with events was disturbed (its
 one-account rounds ranged from 285 to 906) and was run again; the table shows
 the rerun.
 
+## Closing the books
+
+```powershell
+.venv\Scripts\python -m ledger.jobs close     # daily, after midnight: through the end of yesterday, IST
+```
+
+A close records, for every account that moved since the last one, its
+balance at the cutoff. After that:
+
+- `GET /accounts/{id}/balance?at=...` is the latest snapshot at or before that
+  moment plus the entries after it, not a scan of the account's history.
+  `final` says whether the books are closed through that moment.
+- `GET /trial-balance?at=...` lists every non-zero balance at a moment and the
+  total per currency, which is zero or the response says `balanced: false`.
+- The invariant audit recomputes every snapshot from the entries.
+
+**The part that is easy to get wrong.** A posting's entries are stamped with
+the time its database transaction *started*, but other sessions only see them
+once it *commits*. A posting that started at 23:59:59.9 and commits at
+00:00:00.3 is stamped inside yesterday. A close that ran at 00:00:00.1 could
+not see it, and the snapshot would be short by exactly that amount, forever,
+with nothing failing. This is the same gap that rules out an "events after id
+N" feed, from the other side.
+
+So every posting takes a shared advisory lock when it inserts its
+transaction row and holds it to COMMIT, and a close takes that lock
+exclusively. The close waits for every posting in flight, and new postings
+wait for the close. A posting that started before the cutoff but reached its
+insert after the close is refused with `period_closed` (409), and its client
+retries with the same key, which now runs in a new transaction stamped after
+the cutoff. The lock is shared, so postings never wait on each other for it,
+only on a close.
+
+**A deadlock the race test found.** With row locks taken `FOR UPDATE`, a
+posting holding an account's row waited on the close's lock, while the close,
+writing that account's snapshot, waited on the row: the snapshot's foreign key
+takes a `KEY SHARE` lock on the account, and `FOR UPDATE` blocks it. Postings
+never change an account's key, so they now lock `FOR NO KEY UPDATE`, which
+still makes postings to one account queue and does not block foreign-key
+checks. Put back, `FOR UPDATE` deadlocks the race test 5 runs of 5.
+
+**The statement endpoint no longer rescans history.** It reads the newest
+`limit` entries and works back from the current balance, in one `REPEATABLE
+READ` snapshot so a posting committing in between cannot skew it.
+
+**What the lock costs: nothing measurable.** `ledger.bench` direct, 20
+threads, 3,000 transfers a round, median of 5 rounds, run back to back with
+the lock off, on, off, on, transfers/s:
+
+| period lock | one settlement account | 8 shards | no shared account | one merchant | 8 buffers |
+|---|---|---|---|---|---|
+| off | 670, 703 | 1,043, 1,040 | 1,017, 1,018 | 697, 692 | 1,014, 977 |
+| on | 670, 679 | 1,008, 1,022 | 1,026, 1,008 | 684, 692 | 1,009, 1,008 |
+
+Every column is inside run-to-run noise. Every figure here is lower than the
+morning's runs in the outbox table, lock on or off: the machine was slower
+in the afternoon, which is why each comparison in this README is made back
+to back, never across sessions.
+
 ## Reconciliation
 
 ```powershell
@@ -410,6 +476,9 @@ set, all of this happens automatically against the bundled Postgres.
 | `GET /accounts/{id}/statement` | entries with running balance |
 | `POST /transfers` | requires `Idempotency-Key` and `Client-Id`; each side is `from_account`/`to_account` (an id) or `from_group`/`to_group` (a shard group, or a merchant with receive buffers, which can only be paid into); 201 when new, 200 plus `Idempotent-Replayed: true` on a retry, 409 for a reused key or an already-posted `external_ref` |
 | `GET /groups/{name}` | a shard group's total balance |
+| `GET /accounts/{id}/balance?at=` | balance at a moment (with a timezone); `final` once the books are closed through it |
+| `GET /trial-balance?at=` | every non-zero balance at a moment, totals per currency |
+| `GET /periods` | how far the books are closed |
 | `POST /transactions/{id}/reverse` | requires `Idempotency-Key` and `Client-Id` |
 | `POST /holds` | `{account, payee, amount, expires_in_seconds}`; requires `Idempotency-Key` and `Client-Id`; default expiry 7 days, at most 30 |
 | `GET /holds/{id}` | status, amounts, expiry, `lapsed` |
@@ -456,8 +525,12 @@ Measured or seen, not fixed:
   does not stop one client claiming to be another; that is the auth layer's job.
 - **The schema is re-applied on local startup**, which briefly locks tables.
   In a deployment, `ledger.migrate` runs once and the service only connects.
-- **The statement endpoint rescans the account's history** to compute running
-  balances on every call.
+- **A close holds every posting back while it runs.** It waits for postings in
+  flight and new ones wait for it. Once a day that is short; how short at
+  scale is not measured here.
+- **One ledger-wide period.** There is no per-currency or per-entity close,
+  and no reopening a closed period: a correction after the close is a new
+  posting in the open period.
 - **The relay connects as the app role**, so that role can also mark an event
   delivered without sending it. It still cannot forge, edit or delete one. A
   separate relay role would close this.
@@ -474,9 +547,9 @@ ledger/core.py      transfer, reverse, holds, statement, invariant audit
 ledger/api.py       FastAPI
 ledger/recon.py     statement parser and two-pass matcher
 ledger/migrate.py   owner-side setup and system accounts
-ledger/jobs.py      scheduled jobs (hold expiry, buffer sweep)
+ledger/jobs.py      scheduled jobs (hold expiry, buffer sweep, daily close)
 ledger/relay.py     delivers outbox events as signed webhooks
 ledger/bench.py     throughput: one hot account vs shards or buffers vs none
 ledger/demo.py      end-to-end run
-tests/              204 tests: core, holds, shard groups, receive buffers, events and the relay, raw-SQL attacks as the app role, races, API, reconciliation
+tests/              220 tests: core, holds, shard groups, receive buffers, closing the books, events and the relay, raw-SQL attacks as the app role, races, API, reconciliation
 ```

@@ -37,7 +37,7 @@ USERS = 400
 
 def setup(owner_url: str, shards: int) -> tuple[list[int], list[int]]:
     with psycopg.connect(owner_url, autocommit=True) as owner:
-        owner.execute("TRUNCATE outbox, entries, transactions, accounts RESTART IDENTITY CASCADE")
+        owner.execute("TRUNCATE ledger_closes, outbox, entries, transactions, accounts RESTART IDENTITY CASCADE")
         if shards == 1:
             sources = [core.create_account(owner, "bank", "INR", allow_negative=True)["id"]]
         else:

@@ -21,7 +21,7 @@ from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from psycopg_pool import ConnectionPool
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from . import core, db
 
@@ -108,6 +108,20 @@ def create_app(pool: ConnectionPool | None = None) -> FastAPI:
     @app.get("/accounts/{account_id}")
     def get_account(account_id: int, c=Depends(conn)):
         return core.get_account(c, account_id)
+
+    @app.get("/accounts/{account_id}/balance")
+    def get_balance_at(account_id: int, at: Annotated[AwareDatetime, Query()], c=Depends(conn)):
+        """Balance at a moment (with a timezone). `final` once the books are closed through it."""
+        return core.balance_at(c, account_id, at)
+
+    @app.get("/trial-balance")
+    def get_trial_balance(at: Annotated[AwareDatetime, Query()], c=Depends(conn)):
+        """Every non-zero balance at a moment, and the total per currency, which must be zero."""
+        return core.trial_balance(c, at)
+
+    @app.get("/periods")
+    def get_periods(c=Depends(conn)):
+        return {"closed_through": core.closed_through(c)}
 
     @app.get("/groups/{name}")
     def get_group(name: str, c=Depends(conn)):

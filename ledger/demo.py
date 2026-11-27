@@ -32,7 +32,7 @@ def main() -> int:
     # Setup is the owner's job: wiping the demo, and creating the one account
     # that may go negative. Everything after runs as the app role.
     with psycopg.connect(owner_url, autocommit=True) as owner:
-        owner.execute("TRUNCATE outbox, entries, transactions, accounts RESTART IDENTITY CASCADE")
+        owner.execute("TRUNCATE ledger_closes, outbox, entries, transactions, accounts RESTART IDENTITY CASCADE")
         bank = core.create_account(owner, "bank:hdfc", "INR", allow_negative=True)["id"]
 
     pool = db.make_pool(db.as_app_role(owner_url), max_size=2)
