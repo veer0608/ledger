@@ -1,8 +1,9 @@
-"""Throughput of deposits through one busy account, a shard group, and none.
+"""Throughput through one busy account, a shard group or receive buffers, and none.
 
     python -m ledger.bench
     python -m ledger.bench --threads 20 --transfers 3000 --rounds 3 --shards 8
     python -m ledger.bench --rtt-ms 0,0.01,5   # simulate round trips (floor is about 3 ms)
+    python -m ledger.bench --only merchant      # just the busy-merchant pair
 
 Uses its own database (BENCH_DATABASE_URL, or `ledger_bench` on the bundled
 local Postgres) and wipes it between runs. Every transfer runs as the app
@@ -145,6 +146,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rtt-ms", default="0",
                     help="comma-separated round-trip times to simulate between the app and Postgres, "
                          "e.g. 0,1,2. Setup and funding bypass the delay; only timed transfers pay it.")
+    ap.add_argument("--only", choices=["merchant", "settlement"], help="run only one pair of scenarios")
     args = ap.parse_args(argv)
     rtts = [float(x) for x in args.rtt_ms.split(",")]
 
@@ -164,6 +166,29 @@ def main(argv: list[str] | None = None) -> int:
             return [(f"k{i}", core.shard_for(c, "bank", client="bench", key=f"k{i}"), rng.choice(users))
                     for i in range(n)]
 
+    def fund(users):
+        with psycopg.connect(owner_url, autocommit=True) as owner:  # outside the timed run
+            mint = core.create_account(owner, "mint", "INR", allow_negative=True)["id"]
+            for i, u in enumerate(users):
+                core.transfer(owner, client="bench", key=f"fund{i}", from_account=mint, to_account=u, amount=10**9)
+
+    def merchant_plain(pool, rng):
+        # Customers paying one merchant, which may not go negative, so it cannot be a shard.
+        _, users = setup(owner_url, 1)
+        fund(users)
+        with psycopg.connect(owner_url, autocommit=True) as owner:
+            m = core.create_account(owner, "merchant", "INR")["id"]
+        return [(f"k{i}", rng.choice(users), m) for i in range(n)]
+
+    def merchant_buffered(pool, rng):
+        _, users = setup(owner_url, 1)
+        fund(users)
+        with psycopg.connect(owner_url, autocommit=True) as owner:
+            m = core.create_account(owner, "merchant", "INR")["id"]
+            core.create_receive_buffers(owner, m, args.shards)
+            return [(f"k{i}", rng.choice(users), core.shard_for(owner, "merchant", client="bench", key=f"k{i}"))
+                    for i in range(n)]
+
     def spread(pool, rng):
         # No shared account at all: the ceiling sharding is chasing.
         _, users = setup(owner_url, 1)
@@ -179,7 +204,13 @@ def main(argv: list[str] | None = None) -> int:
         ("one settlement account", single),
         (f"settlement group, {args.shards} shards", sharded),
         ("no shared account (user to user)", spread),
+        ("one merchant account", merchant_plain),
+        (f"merchant, {args.shards} receive buffers", merchant_buffered),
     ]
+    if args.only == "settlement":
+        scenarios = scenarios[:2]
+    elif args.only == "merchant":
+        scenarios = scenarios[3:]
     print(f"{args.threads} threads, {n} transfers per round, median of {args.rounds} rounds")
     for rtt in rtts:
         proxy = LatencyProxy(params.get("host") or "127.0.0.1", int(params.get("port") or 5432), rtt) if rtt else None

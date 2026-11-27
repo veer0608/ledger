@@ -18,6 +18,7 @@
 --   5. an external reference (UTR) is posted at most once, unless reversed
 --   6. money on hold cannot be spent, a hold resolves exactly once, and a
 --      capture moves exactly what it says to the hold's payee
+--   7. a receive buffer pays nobody but its own merchant, and only by a sweep
 
 CREATE TABLE IF NOT EXISTS accounts (
     id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -48,6 +49,32 @@ BEGIN
     END IF;
 END $$;
 CREATE INDEX IF NOT EXISTS accounts_shard_group_idx ON accounts (shard_group, id) WHERE shard_group IS NOT NULL;
+
+-- Receive buffers: the same trick for a busy account that may NOT go
+-- negative, such as a merchant taking thousands of payments. Its floor rules
+-- out ordinary shards, but money arriving can never break a floor. So
+-- payments land in buffer rows (NAME#0..N-1, receives_for = the merchant),
+-- each with its own row lock, and a sweep moves them into the merchant.
+-- The only way money leaves a buffer is a sweep to its own merchant
+-- (ledger_check_buffer_debit, below), so a buffer can never pay anyone else.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = current_schema() AND table_name = 'accounts' AND column_name = 'receives_for') THEN
+        ALTER TABLE accounts
+            ADD COLUMN receives_for bigint,
+            ADD CONSTRAINT receives_for_same_currency
+                FOREIGN KEY (receives_for, currency) REFERENCES accounts (id, currency),
+            DROP CONSTRAINT IF EXISTS shard_needs_negative,
+            -- A shard either may go negative (a settlement shard) or is a
+            -- receive buffer, which has a floor like any customer account.
+            ADD CONSTRAINT shard_kind CHECK (
+                shard_group IS NULL OR allow_negative OR receives_for IS NOT NULL),
+            ADD CONSTRAINT buffer_shape CHECK (
+                receives_for IS NULL OR (shard_group IS NOT NULL AND NOT allow_negative AND receives_for <> id));
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS accounts_receives_for_idx ON accounts (receives_for) WHERE receives_for IS NOT NULL;
 
 -- Upgrade a database created before holds existed.
 DO $$
@@ -194,6 +221,41 @@ CREATE CONSTRAINT TRIGGER transactions_balanced
     AFTER INSERT ON transactions
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW EXECUTE FUNCTION ledger_check_balanced();
+
+
+-- Receive buffers pay only their merchant. At COMMIT, a transaction that
+-- debits a buffer must be exactly a sweep: that debit and an equal credit to
+-- the buffer's own merchant, nothing else. So a payment into a buffer cannot
+-- be reversed out of it, a hold cannot be captured from it, and the app
+-- cannot route a payout through it.
+CREATE OR REPLACE FUNCTION ledger_check_buffer_debit() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    merchant bigint;
+BEGIN
+    IF NEW.amount >= 0 THEN
+        RETURN NULL;
+    END IF;
+    SELECT receives_for INTO merchant FROM accounts WHERE id = NEW.account_id;
+    IF merchant IS NULL THEN
+        RETURN NULL;
+    END IF;
+    IF (SELECT array_agg(ARRAY[account_id, amount] ORDER BY account_id, amount)
+        FROM entries WHERE transaction_id = NEW.transaction_id)
+       IS DISTINCT FROM
+       (SELECT array_agg(ARRAY[a, m] ORDER BY a, m)
+        FROM (VALUES (NEW.account_id, NEW.amount), (merchant, -NEW.amount)) v (a, m)) THEN
+        RAISE EXCEPTION 'account % is a receive buffer: money leaves it only by a sweep to account %',
+            NEW.account_id, merchant
+            USING ERRCODE = 'check_violation', CONSTRAINT = 'buffer_pays_only_its_merchant';
+    END IF;
+    RETURN NULL;
+END $$;
+
+DROP TRIGGER IF EXISTS entries_buffer_debit ON entries;
+CREATE CONSTRAINT TRIGGER entries_buffer_debit
+    AFTER INSERT ON entries
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION ledger_check_buffer_debit();
 
 
 -- Rule 5: one live posting per external reference. A webhook redelivered

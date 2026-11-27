@@ -80,6 +80,12 @@ class CurrencyMismatch(LedgerError):
     code = "currency_mismatch"
 
 
+class ReceiveOnly(LedgerError):
+    """Money leaves a receive buffer only by a sweep to its own merchant."""
+    status = 422
+    code = "receive_buffer"
+
+
 @dataclass(frozen=True)
 class Posted:
     transaction_id: int
@@ -149,9 +155,11 @@ def create_account(conn, name: str, currency: str, allow_negative: bool = False,
 
 def get_account(conn, account_id: int) -> dict:
     row = _cur(conn).execute(
-        """SELECT id, name, currency, allow_negative, shard_group, balance, held,
-                  balance - held AS available, created_at
-           FROM accounts WHERE id = %s""",
+        """SELECT a.id, a.name, a.currency, a.allow_negative, a.shard_group, a.receives_for, a.balance, a.held,
+                  a.balance - a.held AS available,
+                  (SELECT coalesce(sum(b.balance), 0) FROM accounts b WHERE b.receives_for = a.id) AS unswept,
+                  a.created_at
+           FROM accounts a WHERE a.id = %s""",
         (account_id,),
     ).fetchone()
     if row is None:
@@ -166,6 +174,76 @@ def create_shard_group(conn, name: str, currency: str, shards: int) -> list[int]
     with conn.transaction():
         return [create_account(conn, f"{name}#{i}", currency, allow_negative=True, shard_group=name)["id"]
                 for i in range(shards)]
+
+
+def create_receive_buffers(conn, merchant: int, buffers: int) -> list[int]:
+    """Owner only. Creates NAME#0 .. NAME#(buffers-1) that take payments for `merchant`.
+
+    Payments to the group NAME land in a buffer, so concurrent payers lock
+    different rows. The merchant's own balance only grows when sweep() moves
+    a buffer into it, and only the merchant's own balance can be spent.
+    """
+    if not isinstance(buffers, int) or not 1 <= buffers <= 64:
+        raise LedgerError("buffers must be between 1 and 64")
+    m = get_account(conn, merchant)
+    if m["receives_for"] is not None or m["shard_group"] is not None:
+        raise LedgerError(f"account {merchant} is itself a shard or buffer")
+    with conn.transaction():
+        try:
+            return [_cur(conn).execute(
+                """INSERT INTO accounts (name, currency, shard_group, receives_for)
+                   VALUES (%s, %s, %s, %s) RETURNING id""",
+                (f"{m['name']}#{i}", m["currency"], m["name"], merchant)).fetchone()["id"]
+                for i in range(buffers)]
+        except errors.InsufficientPrivilege:
+            raise Forbidden("only the database owner can create receive buffers") from None
+        except errors.UniqueViolation:
+            raise Conflict(f"buffers for {m['name']!r} already exist") from None
+
+
+SWEEP_CLIENT = "ledger:sweep"
+
+
+def sweep(conn, buffer: int) -> Posted | None:
+    """Move everything in a receive buffer to its merchant. None if it was empty.
+
+    The balance is read under the row locks, so two sweeps of one buffer
+    queue and the second finds it empty. The key is the buffer and its last
+    entry, which is unique under that lock.
+    """
+    with conn.transaction():
+        cur = _cur(conn)
+        row = cur.execute("SELECT receives_for FROM accounts WHERE id = %s", (buffer,)).fetchone()
+        if row is None:
+            raise NotFound(f"account {buffer} not found")
+        merchant = row["receives_for"]
+        if merchant is None:
+            raise LedgerError(f"account {buffer} is not a receive buffer")
+        locked = {r["id"]: r for r in cur.execute(
+            "SELECT id, currency, balance FROM ledger_lock_accounts(%s)", ([buffer, merchant],))}
+        amount = locked[buffer]["balance"]
+        if amount == 0:
+            return None
+        last = cur.execute("SELECT max(id) AS id FROM entries WHERE account_id = %s", (buffer,)).fetchone()["id"]
+        key = f"{buffer}:{last}"
+        txn_id = _claim_transaction(cur, SWEEP_CLIENT, key,
+                                    _request_hash({"op": "sweep", "buffer": buffer, "amount": amount}),
+                                    locked[buffer]["currency"], memo=f"sweep of receive buffer {buffer}")
+        cur.executemany(
+            "INSERT INTO entries (transaction_id, account_id, currency, amount) VALUES (%s, %s, %s, %s)",
+            [(txn_id, buffer, locked[buffer]["currency"], -amount),
+             (txn_id, merchant, locked[buffer]["currency"], amount)])
+    return Posted(txn_id, replayed=False)
+
+
+def sweep_all(conn, merchant: int | None = None) -> int:
+    """Sweep every non-empty buffer (of one merchant, or all). Returns how many moved money."""
+    query = "SELECT id FROM accounts WHERE receives_for IS NOT NULL AND balance > 0"
+    params: tuple = ()
+    if merchant is not None:
+        query += " AND receives_for = %s"
+        params = (merchant,)
+    return sum(1 for (b,) in conn.execute(query + " ORDER BY id", params).fetchall() if sweep(conn, b))
 
 
 def shard_for(conn, group: str, *, client: str, key: str) -> int:
@@ -311,7 +389,8 @@ def _post(conn, *, client: str, key: str, request_hash: str, legs: list[tuple[in
         with conn.transaction():
             cur = _cur(conn)
             accounts = {r["id"]: r for r in cur.execute(
-                "SELECT id, currency, balance, held, allow_negative FROM ledger_lock_accounts(%s)", (ids,))}
+                "SELECT id, currency, balance, held, allow_negative, receives_for "
+                "FROM ledger_lock_accounts(%s)", (ids,))}
             missing = sorted(set(ids) - accounts.keys())
             if missing:
                 raise NotFound(f"account {missing[0]} not found")
@@ -336,6 +415,10 @@ def _post(conn, *, client: str, key: str, request_hash: str, legs: list[tuple[in
                 net[acct] += amount
             for acct, delta in sorted(net.items()):
                 a = accounts[acct]
+                if delta < 0 and a["receives_for"] is not None:
+                    raise ReceiveOnly(f"account {acct} is a receive buffer for account {a['receives_for']}: "
+                                      f"it takes payments and is swept, it never pays. Pay or refund from "
+                                      f"account {a['receives_for']}")
                 available = a["balance"] - a["held"]
                 if not a["allow_negative"] and available + delta < 0:
                     raise InsufficientFunds(
@@ -361,6 +444,8 @@ def _post(conn, *, client: str, key: str, request_hash: str, legs: list[tuple[in
         # Backstop: the explicit check above should always fire first.
         if exc.diag.constraint_name == "balance_floor":
             raise InsufficientFunds("balance would go below zero") from None
+        if exc.diag.constraint_name == "buffer_pays_only_its_merchant":
+            raise ReceiveOnly(exc.diag.message_primary) from None
         raise
     except errors.NumericValueOutOfRange:
         raise LedgerError("balance would exceed the largest representable amount") from None
@@ -422,10 +507,13 @@ def authorize(conn, *, client: str, key: str, account: int, payee: int, amount: 
         with conn.transaction():
             cur = _cur(conn)
             payer = cur.execute(
-                "SELECT id, currency, balance, held, allow_negative FROM ledger_lock_accounts(%s)", ([account],)
+                "SELECT id, currency, balance, held, allow_negative, receives_for "
+                "FROM ledger_lock_accounts(%s)", ([account],)
             ).fetchone()
             if payer is None:
                 raise NotFound(f"account {account} not found")
+            if payer["receives_for"] is not None:
+                raise ReceiveOnly(f"account {account} is a receive buffer and cannot hold money for anyone")
             payee_row = cur.execute("SELECT currency FROM accounts WHERE id = %s", (payee,)).fetchone()
             if payee_row is None:
                 raise NotFound(f"account {payee} not found")

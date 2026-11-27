@@ -2,8 +2,8 @@
 
 A double-entry ledger on Postgres: the part of a payments company that decides
 whether money moved. Transfers are idempotent, balances stay correct under
-concurrent load, history is append-only, a bank reference is credited at most
-once, money can be held and captured later the way a card authorisation works,
+concurrent load (including on the one account every payment touches),
+history is append-only, a bank reference is credited at most once, money can be held and captured later the way a card authorisation works,
 every change is published as a signed webhook event that cannot be lost or
 invented, and a reconciliation job checks the ledger against a bank statement.
 
@@ -32,6 +32,7 @@ can disable any trigger.
 | A hold resolves exactly once | guard trigger allows only pending to captured, voided or expired | `test_capture_versus_void_race` |
 | A capture pays exactly what it says to the hold's payee | deferred trigger checks the capture transaction's entries at COMMIT | `test_capture_without_paying_the_payee_is_refused` |
 | An expired hold cannot be captured | the guard trigger compares `expires_at` to the database clock | `test_expired_hold_cannot_be_captured_and_is_released_by_the_job` |
+| A busy merchant's receive buffer pays only that merchant | deferred trigger at COMMIT: a debit from a buffer must be exactly a sweep into its merchant; only the owner creates buffers | `test_buffers::test_the_database_refuses_a_buffer_debit_the_app_did_not_check` |
 | Every committed posting and hold change has exactly one event, and a rolled-back one has none | a trigger writes the event in the same database transaction; `UNIQUE (event_type, subject_id)` | `test_outbox::test_a_rolled_back_transfer_writes_no_event` |
 | The app cannot forge, rewrite or delete an event | no `INSERT` grant on the outbox; a guard trigger freezes content, even for the owner | `test_app_role_cannot_tamper_with_events` |
 | Relays running together do not send an event twice at once | claim with `FOR UPDATE SKIP LOCKED`, then a lease | `test_relays_running_together_deliver_each_event_once` |
@@ -73,6 +74,9 @@ protection is removed. Each one was checked by breaking the code on purpose:
 | `authorize` skips the replay check after taking the lock | 18 of 20 identical retries are refused for lack of the money the first one reserved |
 | `capture` skips its own expiry check | still refused: the database guard raises instead, with a less friendly error |
 | `authorize` skips its funds check | **all tests still pass**: the balance floor refuses the hold |
+| `sweep` reads the buffer's balance before taking its lock | 19 of 20 concurrent sweeps of one buffer crash; the buffer's floor stops the money moving twice (three runs) |
+| Remove the database's sweep-only rule for buffers | two raw-SQL tests pay a stranger out of a buffer |
+| Remove the application's check that a buffer cannot pay | **all money tests still pass**: the database refuses; only the API's error code changes, to `insufficient_funds` |
 | The relay claims events without `FOR UPDATE SKIP LOCKED` | 8 relays send 151 events 211 times; fails 5 runs of 5 |
 | The relay's failure write is not fenced on `attempts` | a relay whose lease ran out pushes back the retry clock of the relay that took over |
 | The event trigger fires at once instead of at COMMIT | events carry no entries, because they are inserted after the transaction row |
@@ -153,6 +157,14 @@ How to read it:
 - **Absolute numbers move with machine load.** The day before, a direct run
   of 3,000 deposits a round measured 965, 1,209 and 1,325. Compare columns
   within one row, not across runs.
+- **The one-account cells at 3 ms and 7 ms did not reproduce.** A rerun on
+  2026-11-27 at 3 ms gave 30 to 35 a second, three rounds, with the outbox's
+  triggers switched off too, against 151 the day before; one round of another
+  run gave 179. About 31 ms a posting is twice the default Windows timer
+  tick of 15.6 ms, so under lock contention the proxy's sleeps probably fall
+  back to the coarse timer some of the time. That is not established. Treat
+  those two cells as unreliable in either direction. The shard and
+  no-shared-account columns held steady across every run (540 to 780).
 
 The details that make it safe:
 
@@ -166,6 +178,56 @@ The details that make it safe:
   not the account. A test sends two deliveries of one UTR to different shards.
 - **Reconciliation takes the group name** and reads every shard;
   `GET /groups/{name}` returns the total.
+
+## Busy merchants: receive buffers
+
+A merchant taking thousands of payments is a hot row too, but it cannot be a
+shard group: a merchant may not go negative, and checking a floor across
+shards needs the group's total under a lock, which is the contention the
+shards were meant to remove.
+
+The way out is that **money arriving can never break a floor**. Only money
+leaving can. So the merchant keeps its one real account, and payments land in
+buffer rows beside it (`merchant:hotel#0` to `#7`), picked by the same hash of
+(client, key) as shards, so retries replay. A sweep moves each buffer into the
+merchant:
+
+```powershell
+.venv\Scripts\python -m ledger.migrate --receive-buffers merchant:hotel 8
+.venv\Scripts\python -m ledger.jobs sweep    # from a scheduler, every minute or so
+```
+
+Payers send to the group (`"to_group": "merchant:hotel"`). The merchant's
+`GET /accounts/{id}` shows `balance`, which it can spend, and `unswept`, which
+has arrived but not yet been swept.
+
+What keeps it safe:
+
+- **A buffer pays only its own merchant.** A deferred trigger checks at
+  COMMIT that any transaction debiting a buffer is exactly a sweep: that debit
+  and an equal credit to its merchant, nothing else. A payout, a hold or a
+  reversal out of a buffer is refused, by the app with a clear error and by
+  the database if the app is bypassed.
+- **Buffers have a floor like any customer account.** A sweep reads the
+  buffer's balance under its row lock, so two sweeps of one buffer queue and
+  the second finds it empty. A mutation test moves that read before the lock:
+  19 of 20 concurrent sweeps then try to move money that is already gone, and
+  the floor refuses every one.
+- **Only the owner creates buffers**, as with shards and mints.
+
+**Throughput.** `python -m ledger.bench --only merchant`, direct (no latency
+proxy), 20 threads, 3,000 payments a round from 400 customers, median of 5
+rounds, transfers/s:
+
+| | one merchant account | 8 receive buffers |
+|---|---|---|
+| first run | 713 | 1,037 |
+| second run | 638 | 898 |
+
+About 1.4 times, close to what shards gave the settlement account with no
+added latency. Behind the 3 ms latency proxy the buffers held 700 to 1,000 a
+second; the one-account figure there is not reported, for the reason in the
+last bullet of the shard section.
 
 ## Events: the outbox
 
@@ -341,9 +403,9 @@ set, all of this happens automatically against the bundled Postgres.
 | Endpoint | |
 |---|---|
 | `POST /accounts` | create an account (never one that may go negative) |
-| `GET /accounts/{id}` | balance |
+| `GET /accounts/{id}` | balance, held, available, and for a merchant with buffers, `unswept` |
 | `GET /accounts/{id}/statement` | entries with running balance |
-| `POST /transfers` | requires `Idempotency-Key` and `Client-Id`; each side is `from_account`/`to_account` (an id) or `from_group`/`to_group` (a shard group); 201 when new, 200 plus `Idempotent-Replayed: true` on a retry, 409 for a reused key or an already-posted `external_ref` |
+| `POST /transfers` | requires `Idempotency-Key` and `Client-Id`; each side is `from_account`/`to_account` (an id) or `from_group`/`to_group` (a shard group, or a merchant with receive buffers, which can only be paid into); 201 when new, 200 plus `Idempotent-Replayed: true` on a retry, 409 for a reused key or an already-posted `external_ref` |
 | `GET /groups/{name}` | a shard group's total balance |
 | `POST /transactions/{id}/reverse` | requires `Idempotency-Key` and `Client-Id` |
 | `POST /holds` | `{account, payee, amount, expires_in_seconds}`; requires `Idempotency-Key` and `Client-Id`; default expiry 7 days, at most 30 |
@@ -377,10 +439,13 @@ set, all of this happens automatically against the bundled Postgres.
 
 Measured or seen, not fixed:
 
-- **Only negative-capable accounts can be sharded.** A busy merchant that
-  receives thousands of payments is also a hot row, but it has a balance
-  floor, and checking a floor across shards needs the group total under a
-  lock: the contention sharding removes. Not solved here.
+- **A merchant can spend only what has been swept.** Payments sit in
+  buffers, shown as `unswept`, until the sweep job runs. A payout or refund
+  that needs them waits for the next sweep, or the job is run first.
+- **A payment into a buffer cannot be reversed**, since a reversal would debit
+  the buffer. Refund it from the merchant's account, as a new transfer.
+- **Captures still lock the merchant's row.** A hold names its payee when it is
+  opened, and the capture credits that account directly, not a buffer.
 - **Latency is simulated, not real.** The benchmark's proxy adds delay on one
   machine; it is not a network between two hosts, and it cannot simulate
   round trips under about 3 ms.
@@ -406,9 +471,9 @@ ledger/core.py      transfer, reverse, holds, statement, invariant audit
 ledger/api.py       FastAPI
 ledger/recon.py     statement parser and two-pass matcher
 ledger/migrate.py   owner-side setup and system accounts
-ledger/jobs.py      scheduled jobs (hold expiry)
+ledger/jobs.py      scheduled jobs (hold expiry, buffer sweep)
 ledger/relay.py     delivers outbox events as signed webhooks
-ledger/bench.py     throughput: one account vs a shard group vs none
+ledger/bench.py     throughput: one hot account vs shards or buffers vs none
 ledger/demo.py      end-to-end run
-tests/              187 tests: core, holds, shard groups, events and the relay, raw-SQL attacks as the app role, races, API, reconciliation
+tests/              203 tests: core, holds, shard groups, receive buffers, events and the relay, raw-SQL attacks as the app role, races, API, reconciliation
 ```
