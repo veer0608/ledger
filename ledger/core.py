@@ -563,6 +563,18 @@ def expire_holds(conn, limit: int = 1000) -> int:
 
 # -------------------------------------------------------------- invariants
 
+def outbox_status(conn) -> dict:
+    """Delivery backlog. Not an invariant: a receiver being down is an outage, not corruption."""
+    return _cur(conn).execute(
+        """SELECT count(*) FILTER (WHERE delivered_at IS NULL AND dead_at IS NULL) AS pending,
+                  count(*) FILTER (WHERE dead_at IS NOT NULL) AS dead,
+                  coalesce(extract(epoch FROM now() - min(created_at)
+                                   FILTER (WHERE delivered_at IS NULL AND dead_at IS NULL)), 0)::int
+                      AS oldest_pending_seconds
+           FROM outbox"""
+    ).fetchone()
+
+
 def check_invariants(conn) -> dict:
     """Audit the whole ledger. Every list should be empty and `ok` true."""
     cur = _cur(conn)
@@ -576,8 +588,10 @@ def check_invariants(conn) -> dict:
     ).fetchall()
     nonzero = [c for c in currency_totals if c["total"] != 0]
     held_drift = cur.execute("SELECT * FROM ledger_held_drift ORDER BY id").fetchall()
+    missing_events = cur.execute("SELECT * FROM ledger_missing_events ORDER BY subject, id").fetchall()
     return {
-        "ok": not drift and not unbalanced and not nonzero and not held_drift,
+        "ok": not drift and not unbalanced and not nonzero and not held_drift and not missing_events,
+        "missing_events": missing_events,
         "balance_drift": drift,
         "held_drift": held_drift,
         "unbalanced_transactions": unbalanced,

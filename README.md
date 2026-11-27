@@ -4,7 +4,8 @@ A double-entry ledger on Postgres: the part of a payments company that decides
 whether money moved. Transfers are idempotent, balances stay correct under
 concurrent load, history is append-only, a bank reference is credited at most
 once, money can be held and captured later the way a card authorisation works,
-and a reconciliation job checks the ledger against a bank statement.
+every change is published as a signed webhook event that cannot be lost or
+invented, and a reconciliation job checks the ledger against a bank statement.
 
 The rules that keep money correct live in the database, not only in Python.
 They are claimed against **the role the service connects as** (`ledger_app`):
@@ -31,6 +32,9 @@ can disable any trigger.
 | A hold resolves exactly once | guard trigger allows only pending to captured, voided or expired | `test_capture_versus_void_race` |
 | A capture pays exactly what it says to the hold's payee | deferred trigger checks the capture transaction's entries at COMMIT | `test_capture_without_paying_the_payee_is_refused` |
 | An expired hold cannot be captured | the guard trigger compares `expires_at` to the database clock | `test_expired_hold_cannot_be_captured_and_is_released_by_the_job` |
+| Every committed posting and hold change has exactly one event, and a rolled-back one has none | a trigger writes the event in the same database transaction; `UNIQUE (event_type, subject_id)` | `test_outbox::test_a_rolled_back_transfer_writes_no_event` |
+| The app cannot forge, rewrite or delete an event | no `INSERT` grant on the outbox; a guard trigger freezes content, even for the owner | `test_app_role_cannot_tamper_with_events` |
+| Relays running together do not send an event twice at once | claim with `FOR UPDATE SKIP LOCKED`, then a lease | `test_relays_running_together_deliver_each_event_once` |
 
 Amounts are `bigint` paise everywhere. There is no float in the schema, the
 code, or the API (the API rejects `1.5`, `1.0`, `"100"` and `true`).
@@ -69,6 +73,9 @@ protection is removed. Each one was checked by breaking the code on purpose:
 | `authorize` skips the replay check after taking the lock | 18 of 20 identical retries are refused for lack of the money the first one reserved |
 | `capture` skips its own expiry check | still refused: the database guard raises instead, with a less friendly error |
 | `authorize` skips its funds check | **all tests still pass**: the balance floor refuses the hold |
+| The relay claims events without `FOR UPDATE SKIP LOCKED` | 8 relays send 151 events 211 times; fails 5 runs of 5 |
+| The relay's failure write is not fenced on `attempts` | a relay whose lease ran out pushes back the retry clock of the relay that took over |
+| The event trigger fires at once instead of at COMMIT | events carry no entries, because they are inserted after the transaction row |
 
 One of these needed a second test. The first duplicate-UTR race sent all 20
 deposits between the same two accounts. The account row locks serialised them
@@ -160,6 +167,82 @@ The details that make it safe:
 - **Reconciliation takes the group name** and reads every shard;
   `GET /groups/{name}` returns the total.
 
+## Events: the outbox
+
+Other services need to know when money moves: a wallet app to notify the
+user, a risk system to score the payment, a warehouse to load it. Publishing
+from the application after the database commit is the dual-write problem: a
+crash between the two loses the event, and publishing before the commit can
+announce a transfer that then rolls back.
+
+Here the event is written **by a trigger, in the same database transaction as
+the money**. If the transfer commits, its event exists; if it rolls back, so
+does the event. The application cannot skip it, and since the app role has no
+`INSERT` on the outbox, it cannot invent one either.
+
+| Event | When |
+|---|---|
+| `transaction.posted` | a transfer or capture commits; carries its entries |
+| `transaction.reversed` | a reversal commits; carries `reverses_id` |
+| `hold.authorized`, `hold.captured`, `hold.voided`, `hold.expired` | a hold opens or resolves |
+
+The transaction event fires at COMMIT, from a deferred trigger, because the
+transaction row is inserted before its entries; fired at once, it would carry
+none. A mutation test pins that.
+
+A relay delivers them:
+
+```powershell
+$env:LEDGER_WEBHOOK_SECRET = "a long random string shared with the receiver"
+.venv\Scripts\python -m ledger.relay --url https://receiver.example/ledger-events
+```
+
+- **At least once.** A relay that crashes after the receiver answered but
+  before recording it sends the event again. Every attempt has the same body
+  and the same `Ledger-Event-Id`, so the receiver dedupes on that id.
+- **Signed.** `Ledger-Signature: t=<unix time>,v1=<hex>` is HMAC-SHA256 over
+  `"<t>.<body>"`. The timestamp is inside the signature, so a captured request
+  cannot be replayed later. `relay.verify(secret, body, header)` is the
+  receiver's side, and it refuses anything older than five minutes.
+- **Retried with backoff.** A non-2xx, a refused connection or a timeout is
+  retried after 2 s, 4 s, 8 s and so on, with jitter, capped at six hours.
+  After 12 attempts (about a day and a half) the event is marked dead, with
+  its last error, for a human.
+- **Several relays can run.** One `UPDATE` claims a batch with
+  `FOR UPDATE SKIP LOCKED` and leases it, so no transaction stays open while
+  sending. If a relay dies, its events come due again when the lease ends.
+  A relay that finishes after its lease ran out cannot overwrite the retry
+  schedule of the relay that took over: its write is fenced on the attempt
+  number.
+- **Not ordered.** A failing event does not hold back the ones behind it.
+  Each payload carries its ids and `created_at`; the statement endpoint is the
+  ordered record of an account.
+
+There is no "events after id N" feed for consumers to poll. Ids are assigned
+when the row is inserted, but rows become visible when their transaction
+commits, and those orders differ: a consumer that saw event 11 and then asked
+for "after 11" would skip an event 10 that committed a moment later. The relay
+has no such gap, because it asks for "everything not yet delivered".
+
+`GET /health` reports the backlog (pending, dead, age of the oldest pending
+event) next to the invariants, and the invariant audit checks that every
+transaction and hold state has its event.
+
+**What it costs.** The event is one more insert, made at COMMIT while the
+posting's row locks are still held. `ledger.bench` direct, 20 threads, 3,000
+transfers a round, median of 5 rounds, transfers/s:
+
+| | one settlement account | 8 shards | no shared account |
+|---|---|---|---|
+| without events (two runs) | 1,007 and 994 | 1,408 and 1,305 | 1,422 and 1,330 |
+| with events | 895 | 1,313 | 1,342 |
+
+On the one busy account it costs about 10%, because every posting now holds
+the bank row a little longer. Where no row is shared, the difference is
+inside the run-to-run noise. The first run with events was disturbed (its
+one-account rounds ranged from 285 to 906) and was run again; the table shows
+the rerun.
+
 ## Reconciliation
 
 ```powershell
@@ -195,8 +278,9 @@ python -m venv .venv
 The demo runs a day of a small wallet business (deposits, a payment between
 users, a fee and its reversal, withdrawals, a retried deposit that replays, a
 redelivered webhook that is refused, a hotel pre-auth captured for less, a
-cancelled ride, a ride still on hold) and reconciles it against a statement
-with problems planted in it:
+cancelled ride, a ride still on hold), delivers the day's events to a local
+receiver that is down for its first request, and reconciles the ledger
+against a statement with problems planted in it:
 
 ```
 app role refused a mint: only the database owner can create an account that may go negative
@@ -211,6 +295,13 @@ balances (held is reserved by open holds; available = balance - held)
   merchant:hotel    1800.00     0.00    1800.00
   merchant:rides       0.00     0.00       0.00
 invariants ok: True
+
+events: 15 delivered, signatures checked; the receiver's one outage (HTTP 503) was retried
+  hold.authorized        3
+  hold.captured          1
+  hold.voided            1
+  transaction.posted     9
+  transaction.reversed   1
 
 reconciliation of bank:hdfc
   matched            3
@@ -259,7 +350,7 @@ set, all of this happens automatically against the bundled Postgres.
 | `GET /holds/{id}` | status, amounts, expiry, `lapsed` |
 | `POST /holds/{id}/capture` | optional `{amount}` for a partial capture; requires `Idempotency-Key` and `Client-Id`; returns the transaction |
 | `POST /holds/{id}/void` | release; 409 if already captured or expired |
-| `GET /health` | full invariant audit; 500 if anything disagrees |
+| `GET /health` | full invariant audit, 500 if anything disagrees; also the event backlog |
 
 ## Decisions
 
@@ -299,17 +390,25 @@ Measured or seen, not fixed:
   In a deployment, `ledger.migrate` runs once and the service only connects.
 - **The statement endpoint rescans the account's history** to compute running
   balances on every call.
+- **The relay connects as the app role**, so that role can also mark an event
+  delivered without sending it. It still cannot forge, edit or delete one. A
+  separate relay role would close this.
+- **One receiver.** Every event goes to one URL; fan-out to several
+  subscribers, each with its own progress, is not built.
+- **The outbox only grows.** Delivered events are never deleted, by design,
+  and there is no archiving yet.
 
 ## Layout
 
 ```
-ledger/schema.sql   tables, triggers, roles and grants, the drift view
+ledger/schema.sql   tables, triggers, roles and grants, the outbox, the audit views
 ledger/core.py      transfer, reverse, holds, statement, invariant audit
 ledger/api.py       FastAPI
 ledger/recon.py     statement parser and two-pass matcher
 ledger/migrate.py   owner-side setup and system accounts
 ledger/jobs.py      scheduled jobs (hold expiry)
+ledger/relay.py     delivers outbox events as signed webhooks
 ledger/bench.py     throughput: one account vs a shard group vs none
 ledger/demo.py      end-to-end run
-tests/              162 tests: core, holds, shard groups, raw-SQL attacks as the app role, races, API, reconciliation
+tests/              187 tests: core, holds, shard groups, events and the relay, raw-SQL attacks as the app role, races, API, reconciliation
 ```

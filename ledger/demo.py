@@ -1,4 +1,5 @@
-"""End-to-end demo: a small wallet business for one day, then a bank reconciliation.
+"""End-to-end demo: a small wallet business for one day, its events delivered
+to a webhook, then a bank reconciliation.
 
     python -m ledger.demo
 
@@ -9,13 +10,18 @@ demo/recon_report.csv.
 from __future__ import annotations
 
 import csv
+import json
 import os
+import secrets
+import threading
+from collections import Counter
 from datetime import timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import psycopg
 
-from . import core, db, recon
+from . import core, db, recon, relay
 
 OUT = db.ROOT / "demo"
 
@@ -26,7 +32,7 @@ def main() -> int:
     # Setup is the owner's job: wiping the demo, and creating the one account
     # that may go negative. Everything after runs as the app role.
     with psycopg.connect(owner_url, autocommit=True) as owner:
-        owner.execute("TRUNCATE entries, transactions, accounts RESTART IDENTITY CASCADE")
+        owner.execute("TRUNCATE outbox, entries, transactions, accounts RESTART IDENTITY CASCADE")
         bank = core.create_account(owner, "bank:hdfc", "INR", allow_negative=True)["id"]
 
     pool = db.make_pool(db.as_app_role(owner_url), max_size=2)
@@ -91,6 +97,7 @@ def main() -> int:
                   f" {recon.fmt(a['available']):>10}")
         health = core.check_invariants(conn)
         print(f"invariants ok: {health['ok']}")
+        deliver_events(conn)
 
         # The bank's view of the same day, with the problems real statements have.
         today = recon.local_today()
@@ -120,6 +127,42 @@ def main() -> int:
     print(recon.summarise(results))
     print(f"\nwrote {stmt_path.relative_to(db.ROOT)} and {report.relative_to(db.ROOT)}")
     return 0
+
+
+def deliver_events(conn) -> None:
+    """Send the day's events to a local receiver that is down for its first request."""
+    secret = secrets.token_hex(16)
+    seen: Counter = Counter()
+    state = {"fail": 1}
+
+    class Receiver(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            if state["fail"]:
+                state["fail"] -= 1
+                self.send_response(503)
+            elif not relay.verify(secret, body, self.headers[relay.SIGNATURE_HEADER]):
+                self.send_response(401)
+            else:
+                seen[json.loads(body)["type"]] += 1
+                self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Receiver)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/ledger-events"
+        counts = relay.run_once(conn, url, secret, relay.Policy(base_delay=0.0))
+    finally:
+        server.shutdown()
+        server.server_close()
+    print(f"\nevents: {counts['delivered']} delivered, signatures checked; the receiver's one outage "
+          f"(HTTP 503) was retried")
+    for kind, n in sorted(seen.items()):
+        print(f"  {kind:<22} {n}")
 
 
 if __name__ == "__main__":

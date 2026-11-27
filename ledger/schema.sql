@@ -383,6 +383,146 @@ GROUP BY a.id
 HAVING a.balance <> coalesce(sum(e.amount), 0);
 
 
+-- ----------------------------------------------------------------- outbox
+-- Every posting and every hold change writes an event row here, in the same
+-- database transaction, from a trigger. So an event exists if and only if
+-- its fact committed: a rolled-back transfer leaves no event, and no code path
+-- can commit money without one. The relay (ledger/relay.py) delivers them.
+--
+-- Delivery state is the only thing that changes after insert:
+--   attempts / next_attempt_at  a relay's claim (a lease) and the retry clock
+--   delivered_at                set once, on a 2xx from the receiver
+--   dead_at                     set once, when attempts run out
+CREATE TABLE IF NOT EXISTS outbox (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    event_type      text        NOT NULL,
+    subject_id      bigint      NOT NULL,
+    payload         jsonb       NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    attempts        int         NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    next_attempt_at timestamptz NOT NULL DEFAULT now(),
+    delivered_at    timestamptz,
+    dead_at         timestamptz,
+    last_error      text,
+    -- One event per fact: a transaction is posted once, a hold reaches each status once.
+    UNIQUE (event_type, subject_id),
+    CHECK (delivered_at IS NULL OR dead_at IS NULL)
+);
+
+CREATE INDEX IF NOT EXISTS outbox_due_idx ON outbox (next_attempt_at, id)
+    WHERE delivered_at IS NULL AND dead_at IS NULL;
+
+
+CREATE OR REPLACE FUNCTION ledger_emit_transaction() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+BEGIN
+    -- Deferred to COMMIT, so the entries inserted after this row are all there.
+    INSERT INTO outbox (event_type, subject_id, payload)
+    SELECT CASE WHEN t.reverses_id IS NULL THEN 'transaction.posted' ELSE 'transaction.reversed' END,
+           t.id,
+           jsonb_build_object(
+               'transaction_id', t.id, 'client_id', t.client_id, 'currency', t.currency,
+               'memo', t.memo, 'external_ref', t.external_ref, 'reverses_id', t.reverses_id,
+               'created_at', t.created_at,
+               'entries', (SELECT jsonb_agg(jsonb_build_object('account_id', e.account_id, 'amount', e.amount)
+                                            ORDER BY e.id)
+                           FROM entries e WHERE e.transaction_id = t.id))
+    FROM transactions t WHERE t.id = NEW.id;
+    RETURN NULL;
+END $$;
+
+DROP TRIGGER IF EXISTS transactions_emit ON transactions;
+CREATE CONSTRAINT TRIGGER transactions_emit
+    AFTER INSERT ON transactions
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION ledger_emit_transaction();
+
+
+CREATE OR REPLACE FUNCTION ledger_emit_hold() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+BEGIN
+    INSERT INTO outbox (event_type, subject_id, payload)
+    VALUES (CASE NEW.status WHEN 'pending' THEN 'hold.authorized' ELSE 'hold.' || NEW.status END,
+            NEW.id,
+            jsonb_build_object(
+                'hold_id', NEW.id, 'client_id', NEW.client_id, 'account_id', NEW.account_id,
+                'payee_id', NEW.payee_id, 'currency', NEW.currency, 'amount', NEW.amount,
+                'status', NEW.status, 'captured_amount', NEW.captured_amount,
+                'capture_transaction_id', NEW.capture_transaction_id,
+                'expires_at', NEW.expires_at, 'resolved_at', NEW.resolved_at));
+    RETURN NULL;
+END $$;
+
+DROP TRIGGER IF EXISTS holds_emit ON holds;
+CREATE TRIGGER holds_emit
+    AFTER INSERT OR UPDATE ON holds
+    FOR EACH ROW EXECUTE FUNCTION ledger_emit_hold();
+
+
+-- An event's content never changes and it is never deleted; delivery state
+-- moves forward only. Nobody, the owner included, can rewrite what a
+-- receiver was told or quietly drop an event.
+CREATE OR REPLACE FUNCTION ledger_outbox_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'outbox events are never deleted' USING ERRCODE = 'restrict_violation';
+    END IF;
+    IF (NEW.id, NEW.event_type, NEW.subject_id, NEW.payload, NEW.created_at)
+       IS DISTINCT FROM (OLD.id, OLD.event_type, OLD.subject_id, OLD.payload, OLD.created_at) THEN
+        RAISE EXCEPTION 'event % is immutable; only its delivery state changes', OLD.id
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+    IF OLD.delivered_at IS NOT NULL OR OLD.dead_at IS NOT NULL THEN
+        RAISE EXCEPTION 'event % is already %', OLD.id,
+            CASE WHEN OLD.delivered_at IS NOT NULL THEN 'delivered' ELSE 'dead' END
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+    IF NEW.attempts < OLD.attempts THEN
+        RAISE EXCEPTION 'event % attempts cannot go down', OLD.id USING ERRCODE = 'restrict_violation';
+    END IF;
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS outbox_guard ON outbox;
+CREATE TRIGGER outbox_guard
+    BEFORE UPDATE OR DELETE ON outbox
+    FOR EACH ROW EXECUTE FUNCTION ledger_outbox_guard();
+
+
+-- Upgrading a database that has history from before the outbox: record an
+-- event for each old fact, marked dead with the reason, so the audit below
+-- holds without replaying old money movements to a receiver as if new.
+INSERT INTO outbox (event_type, subject_id, payload, dead_at, last_error)
+SELECT CASE WHEN t.reverses_id IS NULL THEN 'transaction.posted' ELSE 'transaction.reversed' END, t.id,
+       jsonb_build_object('transaction_id', t.id), now(), 'recorded before the outbox existed; never sent'
+FROM transactions t
+WHERE NOT EXISTS (SELECT 1 FROM outbox o WHERE o.subject_id = t.id AND o.event_type LIKE 'transaction.%');
+INSERT INTO outbox (event_type, subject_id, payload, dead_at, last_error)
+SELECT 'hold.authorized', h.id, jsonb_build_object('hold_id', h.id), now(),
+       'recorded before the outbox existed; never sent'
+FROM holds h
+WHERE NOT EXISTS (SELECT 1 FROM outbox o WHERE o.subject_id = h.id AND o.event_type = 'hold.authorized');
+INSERT INTO outbox (event_type, subject_id, payload, dead_at, last_error)
+SELECT 'hold.' || h.status, h.id, jsonb_build_object('hold_id', h.id), now(),
+       'recorded before the outbox existed; never sent'
+FROM holds h
+WHERE h.status <> 'pending'
+  AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.subject_id = h.id AND o.event_type = 'hold.' || h.status);
+
+
+-- Audit view: committed facts with no event. Should always be empty.
+CREATE OR REPLACE VIEW ledger_missing_events AS
+SELECT 'transaction' AS subject, t.id
+FROM transactions t
+WHERE NOT EXISTS (SELECT 1 FROM outbox o WHERE o.subject_id = t.id AND o.event_type LIKE 'transaction.%')
+UNION ALL
+SELECT 'hold', h.id
+FROM holds h
+WHERE NOT EXISTS (SELECT 1 FROM outbox o WHERE o.subject_id = h.id AND o.event_type = 'hold.authorized')
+   OR (h.status <> 'pending'
+       AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.subject_id = h.id AND o.event_type = 'hold.' || h.status));
+
+
 -- The app role. Created without LOGIN; db.migrate sets its password.
 DO $$
 BEGIN
@@ -412,5 +552,13 @@ GRANT INSERT (client_id, idempotency_key, request_hash, account_id, payee_id, cu
     ON holds TO ledger_app;
 GRANT UPDATE (status, captured_amount, capture_transaction_id, resolved_at) ON holds TO ledger_app;
 
-REVOKE ALL ON FUNCTION ledger_apply_entry(), ledger_hold_apply(), ledger_lock_accounts(bigint[]) FROM PUBLIC;
+-- Outbox: no INSERT for the app at all, so it cannot forge an event; only the
+-- triggers above write one. The relay connects as the app role and may change
+-- delivery state, which the guard trigger keeps moving forward.
+REVOKE ALL ON outbox, ledger_missing_events FROM PUBLIC, ledger_app;
+GRANT SELECT ON outbox, ledger_missing_events TO ledger_app;
+GRANT UPDATE (attempts, next_attempt_at, delivered_at, dead_at, last_error) ON outbox TO ledger_app;
+
+REVOKE ALL ON FUNCTION ledger_apply_entry(), ledger_hold_apply(), ledger_lock_accounts(bigint[]),
+    ledger_emit_transaction(), ledger_emit_hold() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION ledger_lock_accounts(bigint[]) TO ledger_app;

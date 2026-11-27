@@ -168,6 +168,7 @@ def create_app(pool: ConnectionPool | None = None) -> FastAPI:
     @app.get("/health")
     def health(c=Depends(conn)):
         report = core.check_invariants(c)
+        report["outbox"] = core.outbox_status(c)
         return JSONResponse(status_code=200 if report["ok"] else 500, content=jsonable_encoder(report))
 
     return app
